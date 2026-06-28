@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>VoiceGeneration 副节点控制台</title>
+<style>
+  :root { --bg:#0b0f12; --panel:#0e1418; --line:#222a2f; --line2:#1a2024; --text:#e2e6e7; --muted:#7d878d; --copper:#d98d52; --green:#5fc88a; --danger:#e2796f; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 -apple-system,"PingFang SC",Segoe UI,Roboto,sans-serif; }
+  header { display:flex; align-items:center; gap:12px; padding:16px 22px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; font-weight:600; } header .sub { color:var(--muted); font-size:12px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--muted); display:inline-block; }
+  .dot.on { background:var(--green); } .dot.off { background:var(--danger); }
+  main { max-width:880px; margin:0 auto; padding:22px; display:flex; flex-direction:column; gap:18px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:18px; }
+  h2 { font-size:13px; margin:0 0 14px; color:#acb3b6; letter-spacing:.04em; text-transform:uppercase; }
+  label { color:#acb3b6; font-size:11px; display:block; margin-bottom:5px; }
+  input, select { width:100%; background:#11171a; color:var(--text); border:1px solid #30383d; border-radius:4px; padding:8px 10px; font-size:13px; }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .field { margin-bottom:12px; min-width:0; }
+  button { background:var(--copper); color:#15100c; border:0; border-radius:4px; padding:8px 14px; font-weight:600; cursor:pointer; font-size:13px; }
+  button.ghost { background:transparent; color:#b9c0c3; border:1px solid #353d42; font-weight:500; }
+  table { width:100%; border-collapse:collapse; }
+  th,td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line2); font-size:12px; }
+  th { color:var(--muted); font-weight:500; }
+  td input, td select { padding:5px 7px; }
+  .num { width:70px; } .dev { width:96px; }
+  .kpi { display:flex; gap:24px; flex-wrap:wrap; margin-bottom:12px; }
+  .kpi div { font-size:12px; color:var(--muted); } .kpi b { display:block; color:var(--text); font-size:18px; font-weight:600; }
+  .err { color:var(--danger); font-size:12px; margin-top:8px; }
+  .ok { color:var(--green); } .muted { color:var(--muted); }
+  .toast { position:fixed; bottom:18px; left:50%; transform:translateX(-50%); background:#1b2228; border:1px solid #35414a; padding:9px 16px; border-radius:6px; font-size:13px; opacity:0; transition:opacity .2s; }
+  .toast.show { opacity:1; }
+  .toolbar { display:flex; gap:10px; align-items:center; margin-top:6px; }
+</style>
+</head>
+<body>
+<header>
+  <span id="conn" class="dot"></span>
+  <div><h1 id="nodeName">副节点控制台</h1><div class="sub" id="nodeSub">—</div></div>
+</header>
+<main>
+  <section>
+    <h2>连接配置</h2>
+    <div class="row">
+      <div class="field"><label>主节点地址 coordinator_url</label><input id="coordinator_url" placeholder="http://mac-main:8080" /></div>
+      <div class="field"><label>令牌 token</label><input id="token" type="password" placeholder="留空=不修改" /></div>
+    </div>
+    <div class="row">
+      <div class="field"><label>本节点 ID（集群内唯一）</label><input id="node_id" placeholder="win-4060-a" /></div>
+      <div class="field"><label>本节点名称</label><input id="node_name" placeholder="Windows 4060" /></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>本节点服务（模型）</h2>
+    <table><thead><tr><th>模型</th><th>启用</th><th>副本数</th><th>设备</th><th>已加载</th></tr></thead>
+      <tbody id="models"></tbody></table>
+    <div class="toolbar"><button onclick="save()">保存并应用</button><span class="muted">保存即热生效，无需重启</span></div>
+  </section>
+
+  <section>
+    <h2>本节点状态</h2>
+    <div class="kpi">
+      <div><b id="capacity">—</b>容量（空闲/总）</div>
+      <div><b id="inflight">—</b>正在执行</div>
+      <div><b id="cDone">—</b>已完成</div>
+      <div><b id="cFail">—</b>失败</div>
+    </div>
+    <div class="toolbar"><button class="ghost" id="pauseBtn" onclick="togglePause()">暂停认领</button><span id="stateText" class="muted"></span></div>
+    <div class="err" id="lastErr"></div>
+  </section>
+
+  <section>
+    <h2>正在执行的任务</h2>
+    <table><thead><tr><th>模型</th><th>文本</th><th>已运行</th></tr></thead><tbody id="jobs"></tbody></table>
+    <p class="muted" id="noJobs" style="display:none">当前没有正在执行的任务。</p>
+  </section>
+
+  <section>
+    <h2>任务池 / 集群（来自协调端）</h2>
+    <div class="kpi"><div><b id="queue">—</b>队列待处理</div></div>
+    <table><thead><tr><th>节点</th><th>角色</th><th>模型</th><th>并发</th><th>状态</th></tr></thead><tbody id="nodes"></tbody></table>
+    <p class="muted" id="noPool" style="display:none">协调端未连接或无节点。</p>
+  </section>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+let MODELS = [];     // 配置表里的模型（可编辑）
+let PAUSED = false;
+const $ = id => document.getElementById(id);
+const esc = s => (s||'').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+function toast(t){ const e=$('toast'); e.textContent=t; e.classList.add('show'); setTimeout(()=>e.classList.remove('show'),1500); }
+
+async function loadConfig(){
+  const c = await (await fetch('/api/config')).json();
+  $('coordinator_url').value = c.coordinator_url || '';
+  $('token').placeholder = c.token_set ? '已设置（留空=不修改）' : '未设置';
+  $('node_id').value = c.node_id || '';
+  $('node_name').value = c.node_name || '';
+  MODELS = c.models || [];
+  $('models').innerHTML = MODELS.map((m,i)=>`<tr>
+    <td>${esc(m.id)}</td>
+    <td><input type="checkbox" data-i="${i}" data-k="enabled" ${m.enabled?'checked':''}></td>
+    <td><input class="num" type="number" min="1" data-i="${i}" data-k="replicas" value="${m.replicas}"></td>
+    <td><select class="dev" data-i="${i}" data-k="device">${['auto','cuda','mps','cpu'].map(d=>`<option ${m.device===d?'selected':''}>${d}</option>`).join('')}</select></td>
+    <td id="loaded-${esc(m.id)}" class="muted">—</td></tr>`).join('');
+}
+
+async function save(){
+  document.querySelectorAll('#models [data-i]').forEach(el=>{
+    const m = MODELS[+el.dataset.i]; const k = el.dataset.k;
+    m[k] = k==='enabled' ? el.checked : (k==='replicas' ? Math.max(1,+el.value||1) : el.value);
+  });
+  const body = {
+    coordinator_url: $('coordinator_url').value.trim(),
+    node_id: $('node_id').value.trim(),
+    node_name: $('node_name').value.trim(),
+    models: MODELS.map(m=>({id:m.id, enabled:m.enabled, replicas:m.replicas, device:m.device})),
+  };
+  const tok = $('token').value; if (tok) body.token = tok;   // 仅在填了才改
+  const r = await fetch('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(r.ok){ $('token').value=''; toast('已保存并应用'); await loadConfig(); } else { toast('保存失败'); }
+}
+
+async function togglePause(){
+  const r = await fetch('/api/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paused:!PAUSED})});
+  if(r.ok){ const d=await r.json(); PAUSED=d.paused; toast(PAUSED?'已暂停认领':'已恢复认领'); }
+}
+
+async function refresh(){
+  try {
+    const s = await (await fetch('/api/status')).json();
+    PAUSED = s.paused;
+    $('conn').className = 'dot ' + (s.connected?'on':'off');
+    $('nodeName').textContent = s.node_name || s.node_id || '副节点';
+    $('nodeSub').textContent = `${s.node_id} · ${s.connected?'已连接协调端':'未连接'} · ${s.coordinator_url||'未配置主节点'}`;
+    $('capacity').textContent = `${s.available}/${s.total_slots}`;
+    $('inflight').textContent = s.inflight;
+    $('cDone').textContent = s.counters.completed;
+    $('cFail').textContent = s.counters.failed;
+    $('pauseBtn').textContent = PAUSED?'恢复认领':'暂停认领';
+    $('stateText').textContent = PAUSED?'已暂停（不认领新任务）':'';
+    $('lastErr').textContent = s.last_error ? ('最近错误：'+s.last_error) : '';
+    (s.models||[]).forEach(m=>{ const el=$('loaded-'+m.id); if(el){ el.textContent=m.loaded?'是':'否'; el.className=m.loaded?'ok':'muted'; }});
+  } catch(e){ $('conn').className='dot off'; }
+
+  try {
+    const jobs = await (await fetch('/api/jobs')).json();
+    $('noJobs').style.display = jobs.length?'none':'block';
+    $('jobs').innerHTML = jobs.map(j=>`<tr><td>${esc(j.model)}</td><td>${esc(j.text)}</td><td>${j.elapsed}s</td></tr>`).join('');
+  } catch(e){}
+
+  try {
+    const co = await (await fetch('/api/coordinator')).json();
+    const nodes = co.nodes||[];
+    $('queue').textContent = (co.queue_depth!=null)?co.queue_depth:'—';
+    $('noPool').style.display = nodes.length?'none':'block';
+    $('nodes').innerHTML = nodes.map(n=>`<tr><td>${esc(n.name)}</td><td>${esc(n.role)}</td><td>${esc((n.models||[]).join('/'))}</td><td>${n.max_concurrency}</td><td class="${n.status==='online'?'ok':'muted'}">${n.status==='online'?'在线':'离线'}</td></tr>`).join('');
+  } catch(e){}
+}
+
+loadConfig();
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

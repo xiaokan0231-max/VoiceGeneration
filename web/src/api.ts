@@ -1,6 +1,6 @@
 import type {
-  ClusterInfo, GenerationDraft, HistoryItem, HistoryResponse, ModelInfo, ProjectDetail,
-  SettingsInfo, SynthesisResult, SystemInfo, VoiceDetail, VoiceInfo,
+  ClusterInfo, ConnectInfo, GenerationDraft, HistoryItem, HistoryResponse, ModelInfo,
+  ProjectDetail, SettingsInfo, SynthesisResult, SystemInfo, VoiceDetail, VoiceInfo,
 } from './types'
 
 async function readError(response: Response): Promise<string> {
@@ -65,4 +65,5 @@ export const api = {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ project_id }),
     }),
   cluster: () => jsonRequest<ClusterInfo>('/v1/cluster/nodes'),
+  connectInfo: () => jsonRequest<ConnectInfo>('/v1/cluster/connect-info'),
 }

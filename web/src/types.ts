@@ -124,3 +124,12 @@ export interface ClusterInfo {
   nodes: ClusterNodeInfo[]
   queue_depth: number
 }
+
+export interface ConnectInfo {
+  host: string
+  port: number
+  reachable: boolean
+  token: string
+  hostname: string
+  candidate_urls: string[]
+}

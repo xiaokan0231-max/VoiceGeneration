@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
-import { Cpu, Database, HardDrive, LoaderCircle, Network, Play, Power, RefreshCw, Save, Server, Square } from 'lucide-react'
+import { Copy, Cpu, Database, HardDrive, LoaderCircle, Network, Play, Power, RefreshCw, Save, Server, Square } from 'lucide-react'
 import { api } from '../api'
-import type { ClusterInfo, RuntimeModel, SettingsInfo, SystemInfo } from '../types'
+import type { ClusterInfo, ConnectInfo, RuntimeModel, SettingsInfo, SystemInfo } from '../types'
 
 const bytes = (value: number) => value < 1024 ** 2 ? `${(value / 1024).toFixed(0)} KB` : value < 1024 ** 3 ? `${(value / 1024 ** 2).toFixed(1)} MB` : `${(value / 1024 ** 3).toFixed(2)} GB`
 
@@ -9,12 +9,17 @@ export default function SettingsPage({ system, onSystemChange }: { system: Syste
   const [settings, setSettings] = useState<SettingsInfo | null>(null)
   const [models, setModels] = useState<RuntimeModel[]>([])
   const [cluster, setCluster] = useState<ClusterInfo | null>(null)
+  const [connect, setConnect] = useState<ConnectInfo | null>(null)
   const [busy, setBusy] = useState('')
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
 
   const load = () => api.settings().then(value => { setSettings(value); setModels(value.models) }).catch(e => setError(e.message))
-  const loadCluster = () => api.cluster().then(setCluster).catch(() => setCluster(null))
+  const loadCluster = () => {
+    api.cluster().then(setCluster).catch(() => setCluster(null))
+    api.connectInfo().then(setConnect).catch(() => setConnect(null))
+  }
+  const copy = (text: string) => { navigator.clipboard?.writeText(text).then(() => setMessage('已复制到剪贴板')).catch(() => undefined) }
   useEffect(() => { void load(); void loadCluster(); const id = window.setInterval(loadCluster, 5000); return () => window.clearInterval(id) }, [])
   const updateSetting = <K extends keyof SettingsInfo>(key: K, value: SettingsInfo[K]) => setSettings(s => s ? ({ ...s, [key]: value }) : s)
   const updateModel = (id: string, update: Partial<RuntimeModel>) => setModels(list => list.map(m => m.id === id ? { ...m, ...update } : m))
@@ -61,6 +66,17 @@ export default function SettingsPage({ system, onSystemChange }: { system: Syste
         </div>)}
         {cluster.nodes.length === 0 && <p className="muted">暂无已注册节点</p>}
       </div>
+      {connect && <div className="connect-info">
+        <h3>副节点接入信息</h3>
+        <p className="muted">把下面的地址和令牌填进副节点控制台（http://&lt;副节点&gt;:8090），即可加入集群。</p>
+        {!connect.reachable && <div className="inline-error">⚠ 当前网关只监听 {connect.host}，其它机器连不上。请把 settings.host 改为 0.0.0.0 后重启网关。</div>}
+        {!connect.token && <p className="muted">⚠ 多机务必设置 cluster.token（两端一致），否则任何人都能接入。</p>}
+        <div className="connect-row"><label>协调端地址</label><div className="url-list">
+          {connect.candidate_urls.map(u => <div key={u} className="url-item"><code>{u}</code><button className="quiet-button" onClick={() => copy(u)}><Copy />复制</button></div>)}
+          {connect.candidate_urls.length === 0 && <span className="muted">未探测到局域网地址</span>}
+        </div></div>
+        <div className="connect-row"><label>令牌 token</label><code className="token-box">{connect.token || '（未设置）'}</code>{connect.token && <button className="quiet-button" onClick={() => copy(connect.token)}><Copy />复制</button>}</div>
+      </div>}
     </section>}
     <section className="settings-section"><div className="settings-title"><div><h2>模型服务</h2><p>保存配置后会安全重载；启动模型可能需要几十秒</p></div></div>
       {models.map(model => <div className="model-config" key={model.id}>

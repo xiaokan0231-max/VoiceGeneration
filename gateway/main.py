@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import signal
+import socket
 import subprocess
 import time
 import wave
@@ -814,6 +815,61 @@ async def job_get(job_id: str, request: Request, authorization: str | None = Dep
         raise HTTPException(404, "未找到任务")
     return history_dict(row, project_name_map().get(row.project_id),
                         cluster.node_name_map().get(row.assigned_node))
+
+
+def _candidate_coordinator_urls(port: int) -> list[str]:
+    """探测本机非回环 IPv4，拼成副节点可填的协调端地址（Tailscale 段优先）。"""
+    ips: list[str] = []
+    seen: set[str] = set()
+
+    def add(ip: str) -> None:
+        if ip and ip not in seen and ":" not in ip and not ip.startswith("127."):
+            seen.add(ip)
+            ips.append(ip)
+
+    try:  # 主网卡出口 IP（UDP connect 不实际发包）
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        add(s.getsockname()[0])
+        s.close()
+    except Exception:
+        pass
+    try:  # 多网卡 / Tailscale
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            add(info[4][0])
+    except Exception:
+        pass
+
+    def is_tailscale(ip: str) -> bool:
+        parts = ip.split(".")
+        return len(parts) == 4 and parts[0] == "100" and parts[1].isdigit() and 64 <= int(parts[1]) <= 127
+
+    ips.sort(key=lambda ip: (not is_tailscale(ip), ip))
+    return [f"http://{ip}:{port}" for ip in ips]
+
+
+@app.get("/v1/cluster/connect-info")
+async def cluster_connect_info(request: Request, authorization: str | None = Depends(check_auth)):
+    """给「服务设置」展示：副节点该怎么连本协调端（地址候选 / 端口 / 令牌）。"""
+    state = get_state(request)
+    _require_token(state, authorization)
+    s = state.config.settings
+    try:
+        hostname = socket.gethostname()
+    except Exception:
+        hostname = ""
+    urls = _candidate_coordinator_urls(s.port)
+    if hostname:
+        mdns = hostname if hostname.endswith(".local") else f"{hostname}.local"
+        urls.append(f"http://{mdns}:{s.port}")
+    return {
+        "host": s.host,
+        "port": s.port,
+        "reachable": s.host not in ("127.0.0.1", "localhost"),
+        "token": s.cluster.token,
+        "hostname": hostname,
+        "candidate_urls": urls,
+    }
 
 
 # --- 项目(Project) CRUD ------------------------------------------------------

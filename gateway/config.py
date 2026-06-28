@@ -27,6 +27,8 @@ class ClusterConfig:
     poll_interval: float = 1.0
     coordinator_runs_jobs: bool = True  # 协调端是否也跑推理
     max_attempts: int = 3
+    agent_host: str = "127.0.0.1"       # 副节点 web 控制台监听地址
+    agent_port: int = 8090              # 副节点 web 控制台端口
 
     @property
     def is_coordinator(self) -> bool:

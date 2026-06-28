@@ -56,12 +56,17 @@ settings:
    把 cosyvoice3 / f5_tts 的 `python` 指向 Windows 上对应 conda 环境的 `python.exe`，
    `options.device: cuda`，`model_dir/repo_dir` 指向本机路径；`system` 模型设 `enabled: false`（Windows 无 `say`）。
    cluster 字段可直接用 `scripts/agent.ps1` 里的环境变量覆盖（node_id 等）。
-4. 启动 agent（编辑 `scripts/agent.ps1` 里的 `VG_COORDINATOR_URL` / `VG_CLUSTER_TOKEN`）：
+4. 启动 agent：
    ```powershell
    conda activate vg-gateway
    ./scripts/agent.ps1
    ```
-   节点会自动注册并开始认领。Windows 节点**不需要** MySQL / ffmpeg（转码与存储都在协调端）。
+   它会起一个**本地控制台**：浏览器打开 **http://127.0.0.1:8090**。
+5. 在控制台里填**主节点地址**和**令牌**（这两项可在【主机】的「服务设置 → 副节点接入信息」里直接复制），
+   再设本节点每个模型的 **启用 / 副本数 / 设备(cuda)** → 点「保存并应用」（**热生效，无需重启**）。
+   控制台还能看：连接状态、容量、正在执行的任务、协调端任务池/全部节点；可一键「暂停/恢复认领」。
+
+   Windows 节点**不需要** MySQL / ffmpeg（转码与存储都在协调端）。
 
 > 环境变量可免改 yaml 覆盖集群字段：`VG_CLUSTER_ROLE / VG_NODE_ID / VG_NODE_NAME / VG_COORDINATOR_URL / VG_CLUSTER_TOKEN`。
 
