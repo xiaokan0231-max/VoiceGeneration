@@ -24,7 +24,7 @@ async def run_worker(supervisor: Supervisor, model_cfg, payload: dict, timeout: 
     """取一个空闲 worker 副本，POST /synthesize，返回 WAV 字节，最后归还副本。"""
     st = await supervisor.acquire(model_cfg.id)
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             r = await client.post(f"{st.base_url}/synthesize", json=payload)
         if r.status_code != 200:
             detail = r.json().get("error", r.text) if r.content else "未知错误"
@@ -111,7 +111,9 @@ class RemoteAgent:
         self.reconnect = asyncio.Event()
         self.status = {"connected": False, "last_error": None, "counters": {"leased": 0, "completed": 0, "failed": 0}}
         self._stop = False
-        self._client = httpx.AsyncClient(timeout=1800)
+        # trust_env=False：忽略 HTTP_PROXY/HTTPS_PROXY 等环境变量，直连协调端，
+        # 避免被本机系统代理/VPN(Clash/V2Ray)截走导致 502。
+        self._client = httpx.AsyncClient(timeout=1800, trust_env=False)
         self._asset_dir = Path(tempfile.gettempdir()) / "vg-agent-assets"
         self._asset_dir.mkdir(parents=True, exist_ok=True)
         self._asset_cache: dict[str, str] = {}
