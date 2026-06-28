@@ -24,6 +24,7 @@ class F5TTSBackend(TTSBackend):
     def _ensure_loaded(self):
         if self._api is not None:
             return
+        import inspect
         import torch
         from f5_tts.api import F5TTS
 
@@ -34,7 +35,15 @@ class F5TTSBackend(TTSBackend):
         else:
             device = requested
         model_name = self.options.get("model", "F5TTS_v1_Base")
-        self._api = F5TTS(model=model_name, device=device)
+        parameters = inspect.signature(F5TTS).parameters
+        if "model" in parameters:
+            self._api = F5TTS(model=model_name, device=device)
+        else:
+            # F5-TTS <= 0.6 uses ``model_type`` and predates the v1 model
+            # aliases. This keeps existing CUDA environments usable without
+            # forcing a torch/toolchain upgrade.
+            legacy_name = "E2-TTS" if str(model_name).startswith("E2") else "F5-TTS"
+            self._api = F5TTS(model_type=legacy_name, device=device)
         self._sr = getattr(self._api, "target_sample_rate", 24000)
 
     def synthesize(self, req: SynthRequest) -> bytes:

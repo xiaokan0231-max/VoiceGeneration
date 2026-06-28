@@ -34,6 +34,12 @@
   .toast { position:fixed; bottom:18px; left:50%; transform:translateX(-50%); background:#1b2228; border:1px solid #35414a; padding:9px 16px; border-radius:6px; font-size:13px; opacity:0; transition:opacity .2s; }
   .toast.show { opacity:1; }
   .toolbar { display:flex; gap:10px; align-items:center; margin-top:6px; }
+  .log-view { max-height:260px; overflow:auto; background:#090d10; border:1px solid var(--line2); border-radius:5px; font:11px/1.55 Consolas,"SFMono-Regular",monospace; }
+  .log-row { display:grid; grid-template-columns:76px 58px 1fr; gap:8px; padding:5px 8px; border-bottom:1px solid #151b1f; }
+  .log-row:last-child { border-bottom:0; }
+  .log-time,.log-info { color:var(--muted); }
+  .log-warning { color:#d9a852; } .log-error { color:var(--danger); }
+  .log-message { white-space:pre-wrap; overflow-wrap:anywhere; }
 </style>
 </head>
 <body>
@@ -78,6 +84,11 @@
     <h2>正在执行的任务</h2>
     <table><thead><tr><th>模型</th><th>文本</th><th>已运行</th></tr></thead><tbody id="jobs"></tbody></table>
     <p class="muted" id="noJobs" style="display:none">当前没有正在执行的任务。</p>
+  </section>
+
+  <section>
+    <h2>运行日志 <span id="logCount" class="muted"></span></h2>
+    <div class="log-view" id="logs"><div class="log-row muted">正在读取日志…</div></div>
   </section>
 
   <section>
@@ -129,17 +140,18 @@ async function save(){
 
 async function toggleConn(){
   const r = await fetch(ENABLED ? '/api/disconnect' : '/api/connect', {method:'POST'});
-  if(r.ok){ const d=await r.json(); ENABLED=d.enabled; toast(ENABLED?'已连接':'已断开'); refresh(); }
+  if(r.ok){ const d=await r.json(); ENABLED=d.enabled; toast(ENABLED?'已启用连接':'已断开'); refresh(); }
 }
 
 async function refresh(){
   try {
     const s = await (await fetch('/api/status')).json();
     ENABLED = s.enabled;
-    $('conn').className = 'dot ' + (s.connected ? 'on' : (s.enabled ? 'warn' : 'off'));
+    const state = s.connection_state || (!s.enabled ? 'disconnected' : (!s.coordinator_url ? 'unconfigured' : (s.connected ? 'connected' : (s.last_error ? 'error' : 'connecting'))));
+    const labels = {disconnected:'已断开', unconfigured:'未配置主节点', connected:'已连接协调端', error:'连接失败', connecting:'连接中…'};
+    $('conn').className = 'dot ' + (state==='connected' ? 'on' : (state==='error'||state==='disconnected' ? 'off' : 'warn'));
     $('nodeName').textContent = s.node_name || s.node_id || '副节点';
-    const state = !s.enabled ? '已断开' : (s.connected ? '已连接协调端' : '连接中…');
-    $('nodeSub').textContent = `${s.node_id} · ${state} · ${s.coordinator_url||'未配置主节点'}`;
+    $('nodeSub').textContent = `${s.node_id} · ${labels[state]||state} · ${s.coordinator_url||'未配置主节点'}`;
     $('capacity').textContent = `${s.available}/${s.total_slots}`;
     $('inflight').textContent = s.inflight;
     $('cDone').textContent = s.counters.completed;
@@ -147,8 +159,8 @@ async function refresh(){
     const btn = $('connBtn');
     btn.textContent = s.enabled ? '断开' : '连接';
     btn.className = s.enabled ? 'danger' : '';
-    $('stateText').textContent = !s.enabled ? '已断开（不连接协调端）' : (s.connected ? '已连接' : '连接中…');
-    $('lastErr').textContent = s.last_error ? ('最近错误：'+s.last_error) : '';
+    $('stateText').textContent = state==='unconfigured' ? '请先填写主节点地址并保存' : (labels[state]||state);
+    $('lastErr').textContent = state==='error' && s.last_error ? ('最近错误：'+s.last_error) : '';
     (s.models||[]).forEach(m=>{ const el=$('loaded-'+m.id); if(el){ el.textContent=m.loaded?'是':'否'; el.className=m.loaded?'ok':'muted'; }});
   } catch(e){ $('conn').className='dot off'; }
 
@@ -164,6 +176,18 @@ async function refresh(){
     $('queue').textContent = (co.queue_depth!=null)?co.queue_depth:'—';
     $('noPool').style.display = nodes.length?'none':'block';
     $('nodes').innerHTML = nodes.map(n=>`<tr><td>${esc(n.name)}</td><td>${esc(n.role)}</td><td>${esc((n.models||[]).join('/'))}</td><td>${n.max_concurrency}</td><td class="${n.status==='online'?'ok':'muted'}">${n.status==='online'?'在线':'离线'}</td></tr>`).join('');
+  } catch(e){}
+
+  try {
+    const logs = await (await fetch('/api/logs')).json();
+    const box = $('logs');
+    $('logCount').textContent = `(${logs.length}/300)`;
+    box.innerHTML = logs.length ? logs.map(l=>{
+      const time = l.time ? new Date(l.time).toLocaleTimeString([], {hour12:false}) : '—';
+      const level = l.level || 'info';
+      return `<div class="log-row"><span class="log-time">${esc(time)}</span><span class="log-${esc(level)}">${esc(level.toUpperCase())}</span><span class="log-message">${esc(l.message)}</span></div>`;
+    }).join('') : '<div class="log-row muted">暂无运行日志。</div>';
+    box.scrollTop = box.scrollHeight;
   } catch(e){}
 }
 
