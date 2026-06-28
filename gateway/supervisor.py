@@ -53,6 +53,7 @@ class Supervisor:
         self.settings = settings
         self.pools: dict[str, list[WorkerState]] = {}
         self.free: dict[str, asyncio.Queue] = {}
+        self._busy: dict[str, set[int]] = {}
         self._locks: dict[str, dict[int, asyncio.Lock]] = {}
         self._reaper_task: asyncio.Task | None = None
         for m in models:
@@ -67,6 +68,7 @@ class Supervisor:
         for i in range(n):
             q.put_nowait(i)
         self.free[cfg.id] = q
+        self._busy[cfg.id] = set()
         self._locks[cfg.id] = {i: asyncio.Lock() for i in range(n)}
 
     # ---- 容量 -----------------------------------------------------------
@@ -81,8 +83,18 @@ class Supervisor:
         """
         return {model_id: len(pool) for model_id, pool in self.pools.items()}
 
+    def available_by_model(self) -> dict[str, int]:
+        """Currently free worker slots per model."""
+        return {
+            model_id: max(0, len(pool) - len(self._busy.get(model_id, set())))
+            for model_id, pool in self.pools.items()
+        }
+
     def available_capacity(self) -> int:
-        return sum(q.qsize() for q in self.free.values())
+        # Derive capacity from the authoritative busy set instead of Queue.qsize().
+        # A worker released after a hot reconfigure belongs to an old pool and
+        # must never inflate the new pool's capacity.
+        return sum(self.available_by_model().values())
 
     def begin_work(self, st: WorkerState, job_id: str | None, text: str = "") -> None:
         st.current_job_id = job_id
@@ -133,22 +145,38 @@ class Supervisor:
     # ---- 执行路径：取/还一个空闲副本 -----------------------------------
     async def acquire(self, model_id: str) -> WorkerState:
         q = self.free[model_id]
-        idx = await q.get()
-        st = self.pools[model_id][idx]
+        while True:
+            idx = await q.get()
+            pool = self.pools.get(model_id)
+            busy = self._busy.get(model_id)
+            if pool is None or busy is None or idx >= len(pool) or idx in busy:
+                continue
+            st = pool[idx]
+            busy.add(idx)
+            break
         try:
             async with self._locks[model_id][idx]:
                 if not st.running:
                     self._spawn(st)
                     await self._wait_healthy(st)
         except Exception:
-            q.put_nowait(idx)  # 起不来也要把槽位还回去
+            self.release(model_id, st)  # 起不来也要把槽位还回去
             raise
         st.last_used = time.time()
         return st
 
     def release(self, model_id: str, st: WorkerState) -> None:
+        pool = self.pools.get(model_id)
+        busy = self._busy.get(model_id)
+        q = self.free.get(model_id)
+        # Ignore stale releases from a pool that was replaced by hot config,
+        # and make release idempotent to prevent duplicate queue tokens.
+        if (pool is None or busy is None or q is None or st.index >= len(pool)
+                or pool[st.index] is not st or st.index not in busy):
+            return
         st.last_used = time.time()
-        self.free[model_id].put_nowait(st.index)
+        busy.remove(st.index)
+        q.put_nowait(st.index)
 
     # ---- 生命周期 --------------------------------------------------------
     def start_reaper(self) -> None:
@@ -180,6 +208,7 @@ class Supervisor:
         q = self.free[model_id]
         while not q.empty():
             q.get_nowait()
+        self._busy[model_id].clear()
         for st in self.pools[model_id]:
             q.put_nowait(st.index)
 
@@ -198,6 +227,7 @@ class Supervisor:
                     self._stop(st)
                 del self.pools[model_id]
                 self.free.pop(model_id, None)
+                self._busy.pop(model_id, None)
                 self._locks.pop(model_id, None)
         # 新建/重建变化的池
         for model_id, cfg in incoming.items():

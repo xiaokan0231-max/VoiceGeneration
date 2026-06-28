@@ -68,6 +68,40 @@ def test_worker_health_check_bypasses_environment_proxy(monkeypatch):
     assert client_options["trust_env"] is False
 
 
+def test_worker_release_is_idempotent():
+    async def scenario():
+        supervisor = Supervisor(Settings(), [ModelConfig(id="cosyvoice3")])
+        worker = supervisor.pools["cosyvoice3"][0]
+        worker.process = FakeProcess()
+        acquired = await supervisor.acquire("cosyvoice3")
+        supervisor.release("cosyvoice3", acquired)
+        supervisor.release("cosyvoice3", acquired)
+        return supervisor.available_capacity(), supervisor.free["cosyvoice3"].qsize()
+
+    available, queue_size = asyncio.run(scenario())
+
+    assert available == 1
+    assert queue_size == 1
+
+
+def test_stale_worker_release_does_not_inflate_reconfigured_pool():
+    async def scenario():
+        original = ModelConfig(id="cosyvoice3", replicas=1)
+        supervisor = Supervisor(Settings(), [original])
+        old_worker = supervisor.pools["cosyvoice3"][0]
+        old_worker.process = FakeProcess()
+        acquired = await supervisor.acquire("cosyvoice3")
+        replacement = ModelConfig(id="cosyvoice3", replicas=2)
+        await supervisor.reconfigure([replacement])
+        supervisor.release("cosyvoice3", acquired)
+        return supervisor.available_capacity(), supervisor.free["cosyvoice3"].qsize()
+
+    available, queue_size = asyncio.run(scenario())
+
+    assert available == 2
+    assert queue_size == 2
+
+
 @pytest.mark.parametrize(
     ("parameters", "expected"),
     [

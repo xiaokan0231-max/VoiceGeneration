@@ -72,7 +72,9 @@
     <h2>本节点状态</h2>
     <div class="kpi">
       <div><b id="capacity">—</b>容量（空闲/总）</div>
-      <div><b id="inflight">—</b>正在执行</div>
+      <div><b id="inflight">—</b>任务处理中</div>
+      <div><b id="synthesizing">—</b>GPU 推理中</div>
+      <div><b id="uploading">—</b>上传/重试</div>
       <div><b id="cDone">—</b>已完成</div>
       <div><b id="cFail">—</b>失败</div>
     </div>
@@ -82,7 +84,7 @@
 
   <section>
     <h2>正在执行的任务</h2>
-    <table><thead><tr><th>模型</th><th>文本</th><th>已运行</th></tr></thead><tbody id="jobs"></tbody></table>
+    <table><thead><tr><th>模型</th><th>阶段</th><th>文本</th><th>已运行</th></tr></thead><tbody id="jobs"></tbody></table>
     <p class="muted" id="noJobs" style="display:none">当前没有正在执行的任务。</p>
   </section>
 
@@ -154,6 +156,8 @@ async function refresh(){
     $('nodeSub').textContent = `${s.node_id} · ${labels[state]||state} · ${s.coordinator_url||'未配置主节点'}`;
     $('capacity').textContent = `${s.available}/${s.total_slots}`;
     $('inflight').textContent = s.inflight;
+    $('synthesizing').textContent = s.synthesizing || 0;
+    $('uploading').textContent = s.uploading || 0;
     $('cDone').textContent = s.counters.completed;
     $('cFail').textContent = s.counters.failed;
     const btn = $('connBtn');
@@ -166,8 +170,9 @@ async function refresh(){
 
   try {
     const jobs = await (await fetch('/api/jobs')).json();
+    const phases = {preparing:'准备中',waiting_worker:'等待 worker',synthesizing:'GPU 推理',uploading:'上传结果',upload_retry:'上传重试',waiting_lease:'等待租约'};
     $('noJobs').style.display = jobs.length?'none':'block';
-    $('jobs').innerHTML = jobs.map(j=>`<tr><td>${esc(j.model)}</td><td>${esc(j.text)}</td><td>${j.elapsed}s</td></tr>`).join('');
+    $('jobs').innerHTML = jobs.map(j=>`<tr><td>${esc(j.model)}</td><td>${esc(phases[j.phase]||j.phase)}</td><td>${esc(j.text)}</td><td>${j.elapsed}s</td></tr>`).join('');
   } catch(e){}
 
   try {

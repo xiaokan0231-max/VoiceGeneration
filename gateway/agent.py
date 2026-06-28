@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 import httpx
 from fastapi import Body, FastAPI
@@ -48,9 +49,12 @@ def connection_state(*, enabled: bool, coordinator_url: str, connected: bool,
 
 
 async def run_worker(supervisor: Supervisor, model_cfg, payload: dict,
-                     timeout: float = 1800) -> WorkerResult:
+                     timeout: float = 1800,
+                     on_acquired: Callable[[], None] | None = None) -> WorkerResult:
     """取一个空闲 worker 副本，POST /synthesize，返回 WAV 字节，最后归还副本。"""
     st = await supervisor.acquire(model_cfg.id)
+    if on_acquired:
+        on_acquired()
     started = time.perf_counter()
     supervisor.begin_work(st, payload.get("job_id"), payload.get("text") or "")
     try:
@@ -192,10 +196,12 @@ class RemoteAgent:
     def __init__(self) -> None:
         self.config = load_config()
         self.supervisor = Supervisor(self.config.settings, self.config.enabled_models())
-        self.active: dict[str, dict] = {}            # job_id -> {model, text, started}
+        self.active: dict[str, dict] = {}            # job_id -> runtime state (phase/lease/etc.)
         self.enabled = self.config.settings.cluster.enabled  # 是否主动连接(网页连接/断开控制)
         self.reconnect = asyncio.Event()
-        self.status = {"connected": False, "last_error": None, "counters": {"leased": 0, "completed": 0, "failed": 0}}
+        self.status = {"connected": False, "last_error": None, "counters": {
+            "leased": 0, "completed": 0, "failed": 0, "upload_retries": 0,
+        }}
         self._logs: deque[dict] = deque(maxlen=300)
         self._last_log: tuple[str, str] | None = None
         self._stop = False
@@ -281,23 +287,42 @@ class RemoteAgent:
     async def _lease_loop(self, url: str) -> None:
         while (not self._stop and not self.reconnect.is_set()
                and self.enabled and self.cluster.coordinator_url == url):
-            active_by_model = Counter(
-                str(job.get("model")) for job in self.active.values() if job.get("model")
+            # A preparing job has not consumed its worker token yet. Active
+            # synthesis is already reflected by Supervisor.available_by_model;
+            # uploads have released their worker and may overlap new inference.
+            reservations = Counter(
+                str(job.get("model"))
+                for job in self.active.values()
+                if job.get("model")
+                and job.get("phase") in {"preparing", "waiting_worker"}
             )
             capacities = {
-                model_id: max(0, slots - active_by_model[model_id])
-                for model_id, slots in self.supervisor.slots_by_model().items()
+                model_id: max(0, slots - reservations[model_id])
+                for model_id, slots in self.supervisor.available_by_model().items()
                 if model_id in self._models()
             }
-            # Defensive fallback for an active job created by an older agent
-            # version without a model field: it still consumes one global slot.
-            unknown_active = max(0, len(self.active) - sum(active_by_model.values()))
+            # Defensive compatibility for an in-memory job created by an
+            # older agent version without a model field.
+            unknown_reservations = sum(
+                1 for job in self.active.values()
+                if not job.get("model")
+                and job.get("phase") in {"preparing", "waiting_worker"}
+            )
             for model_id in sorted(capacities):
-                reduction = min(unknown_active, capacities[model_id])
+                reduction = min(unknown_reservations, capacities[model_id])
                 capacities[model_id] -= reduction
-                unknown_active -= reduction
-                if unknown_active <= 0:
+                unknown_reservations -= reduction
+                if unknown_reservations <= 0:
                     break
+            # Keep workers useful during a short upload outage, but bound the
+            # number of buffered WAV results so a long coordinator failure
+            # cannot grow memory usage without limit.
+            backlog_remaining = max(
+                0, self.supervisor.total_slots() * 2 - len(self.active)
+            )
+            for model_id in sorted(capacities):
+                capacities[model_id] = min(capacities[model_id], backlog_remaining)
+                backlog_remaining -= capacities[model_id]
             capacity = sum(capacities.values())
             jobs: list[dict] = []
             # capacity=0 也必须继续长轮询：协调端会在 lease 入口更新
@@ -321,10 +346,21 @@ class RemoteAgent:
                 return
             for job in jobs:
                 self.status["counters"]["leased"] += 1
+                current = self.active.get(job["id"])
+                if current is not None:
+                    # The coordinator may requeue a lease after a restart or
+                    # temporary disconnect. Reuse the in-progress synthesis or
+                    # buffered WAV instead of starting the same GPU work again.
+                    current["lease_valid"] = True
+                    current["lease_count"] = current.get("lease_count", 1) + 1
+                    self._log("warning", f"任务 {job['id']} 重新认领，复用现有结果")
+                    continue
                 # 同步登记，避免下一轮 lease 在任务populate active 前重复计算容量→超额认领
                 self.active[job["id"]] = {"model": job["model"],
                                           "text": (job.get("text") or "")[:60],
-                                          "started": time.monotonic()}
+                                          "started": time.monotonic(),
+                                          "phase": "preparing", "lease_valid": True,
+                                          "lease_count": 1}
                 self._log("info", f"认领任务 {job['id']}（{job['model']}）")
                 asyncio.create_task(self._run_job(job))
             if not jobs:
@@ -356,6 +392,7 @@ class RemoteAgent:
 
     async def _run_job(self, job: dict) -> None:
         jid = job["id"]  # 已在 _lease_loop 登记进 self.active
+        state = self.active[jid]
         started = time.perf_counter()
         heartbeat = asyncio.create_task(self._job_heartbeat(jid))
         try:
@@ -370,33 +407,85 @@ class RemoteAgent:
                 "ref_audio_path": ref_audio_path, "ref_text": job.get("ref_text"),
                 "job_id": jid,
             }
-            worker_result = await run_worker(self.supervisor, model, payload)
-            result = await self._client.post(
-                f"{self.base}/v1/cluster/jobs/{jid}/result", headers=self.headers,
-                files={"audio": ("out.wav", worker_result.wav, "audio/wav")},
-                data={
-                    "node_id": self.cluster.node_id,
-                    "elapsed": str(time.perf_counter() - started),
-                    "worker_id": worker_result.worker_id,
-                    "inference_seconds": str(worker_result.inference_seconds),
-                },
+            state["phase"] = "waiting_worker"
+            worker_result = await run_worker(
+                self.supervisor, model, payload,
+                on_acquired=lambda: state.update(phase="synthesizing"),
             )
-            result.raise_for_status()
+            state["phase"] = "uploading"
+            await self._upload_result(
+                jid, worker_result.wav, time.perf_counter() - started, state,
+                worker_id=worker_result.worker_id,
+                inference_seconds=worker_result.inference_seconds,
+            )
             self.status["counters"]["completed"] += 1
             self._log("info", f"任务 {jid} 完成，耗时 {time.perf_counter() - started:.1f}s")
         except Exception as exc:  # noqa: BLE001
             self.status["counters"]["failed"] += 1
-            self._log("error", f"任务 {jid} 失败：{exc}")
-            try:
-                await self._client.post(f"{self.base}/v1/cluster/jobs/{jid}/fail",
-                                        headers=self.headers,
-                                        json={"node_id": self.cluster.node_id, "error": str(exc)})
-            except httpx.HTTPError:
-                pass
+            level = "error" if state.get("lease_valid", True) else "warning"
+            self._log(level, f"任务 {jid} 失败：{self._http_error(exc)}")
+            # Never fail a lease that the coordinator has already requeued or
+            # assigned elsewhere; doing so could corrupt the new attempt.
+            if state.get("lease_valid", True):
+                try:
+                    await self._client.post(f"{self.base}/v1/cluster/jobs/{jid}/fail",
+                                            headers=self.headers,
+                                            json={"node_id": self.cluster.node_id, "error": str(exc)},
+                                            timeout=10)
+                except httpx.HTTPError:
+                    pass
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
-            self.active.pop(jid, None)
+            if self.active.get(jid) is state:
+                self.active.pop(jid, None)
+
+    async def _upload_result(self, job_id: str, wav: bytes, elapsed: float,
+                             state: dict, attempts: int = 8,
+                             worker_id: str | None = None,
+                             inference_seconds: float | None = None) -> None:
+        """Retry only the buffered WAV; never rerun synthesis for a short outage."""
+        delay = 1.0
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            if not state.get("lease_valid", True):
+                state["phase"] = "waiting_lease"
+                last_error = RuntimeError("协调端租约已失效，等待重新认领")
+            else:
+                state["phase"] = "uploading" if attempt == 1 else "upload_retry"
+                try:
+                    data = {"node_id": self.cluster.node_id, "elapsed": str(elapsed)}
+                    if worker_id:
+                        data["worker_id"] = worker_id
+                    if inference_seconds is not None:
+                        data["inference_seconds"] = str(inference_seconds)
+                    result = await self._client.post(
+                        f"{self.base}/v1/cluster/jobs/{job_id}/result", headers=self.headers,
+                        files={"audio": ("out.wav", wav, "audio/wav")},
+                        data=data,
+                        timeout=120,
+                    )
+                    result.raise_for_status()
+                    if attempt > 1:
+                        self._log("info", f"任务 {job_id} 结果重传成功（第 {attempt} 次）")
+                    return
+                except (httpx.HTTPError, RuntimeError) as exc:
+                    last_error = exc
+                    status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+                    retryable = status_code is None or status_code >= 500 or status_code in {408, 429}
+                    if not retryable:
+                        raise
+            if attempt >= attempts:
+                break
+            self.status["counters"]["upload_retries"] += 1
+            self._log(
+                "warning",
+                f"任务 {job_id} 结果上传失败，{delay:.0f}s 后重试（{attempt}/{attempts}）："
+                f"{self._http_error(last_error)}",
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30.0)
+        raise last_error or RuntimeError("结果上传失败")
 
     async def _job_heartbeat(self, job_id: str) -> None:
         """Extend an active job lease until synthesis/result upload finishes."""
@@ -412,8 +501,13 @@ class RemoteAgent:
                     timeout=10,
                 )
                 response.raise_for_status()
-                if not response.json().get("ok"):
-                    raise RuntimeError("协调端未找到有效租约")
+                state = self.active.get(job_id)
+                if state is None:
+                    return
+                ok = bool(response.json().get("ok"))
+                if not ok:
+                    state["lease_valid"] = False
+                    self._log("warning", f"任务 {job_id} 租约已失效，等待协调端重新认领", dedupe=True)
             except Exception as exc:  # noqa: BLE001
                 self._log(
                     "warning",
@@ -430,6 +524,7 @@ class RemoteAgent:
     # ---- 给 web 控制台用 -----------------------------------------------
     def snapshot(self) -> dict:
         c, sup = self.cluster, self.supervisor
+        phases = [state.get("phase") for state in self.active.values()]
         return {
             "node_id": c.node_id, "node_name": c.node_name, "role": "agent",
             "coordinator_url": c.coordinator_url, "token_set": bool(c.token),
@@ -440,6 +535,9 @@ class RemoteAgent:
             ),
             "enabled": self.enabled, "total_slots": sup.total_slots(),
             "available": sup.available_capacity(), "inflight": len(self.active),
+            "synthesizing": phases.count("synthesizing"),
+            "uploading": sum(p in {"uploading", "upload_retry", "waiting_lease"} for p in phases),
+            "waiting": sum(p in {"preparing", "waiting_worker"} for p in phases),
             "counters": self.status["counters"],
             "models": [
                 {"id": m.id, "enabled": m.enabled, "replicas": m.replicas,
@@ -450,7 +548,9 @@ class RemoteAgent:
 
     def jobs(self) -> list[dict]:
         now = time.monotonic()
-        return [{"id": jid, "model": j["model"], "text": j["text"], "elapsed": round(now - j["started"], 1)}
+        return [{"id": jid, "model": j["model"], "text": j["text"],
+                 "phase": j.get("phase", "preparing"),
+                 "elapsed": round(now - j["started"], 1)}
                 for jid, j in list(self.active.items())]
 
     def logs(self) -> list[dict]:
