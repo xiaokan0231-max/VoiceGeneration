@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -123,10 +124,10 @@ def test_cluster_lease_is_atomic_and_respects_capacity():
 def test_cluster_requeue_expired_and_fail():
     row = _queued("rk")
     cluster.lease_jobs("nodeA", ["cosyvoice3"], 1, 120)
-    # 把租约改到过去
+    # 把租约改到明确的过去时间（用固定旧时间，避免 DATETIME 秒级取整带来的临界抖动）
     with db_session() as db:
         obj = db.get(GenerationHistory, row.id)
-        obj.lease_expires_at = obj.created_at  # 远早于现在
+        obj.lease_expires_at = datetime(2000, 1, 1)
         db.commit()
     assert cluster.requeue_expired(max_attempts=3) == 1
     after = db_session().get(GenerationHistory, row.id)

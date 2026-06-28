@@ -19,14 +19,17 @@ from .supervisor import Supervisor
 
 
 async def run_worker(supervisor: Supervisor, model_cfg, payload: dict, timeout: float = 1800) -> bytes:
-    """确保本地 worker 在跑，POST /synthesize，返回 WAV 字节。"""
-    await supervisor.ensure_running(model_cfg.id)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.post(f"{model_cfg.base_url}/synthesize", json=payload)
-    if r.status_code != 200:
-        detail = r.json().get("error", r.text) if r.content else "未知错误"
-        raise RuntimeError(str(detail))
-    return r.content
+    """取一个空闲 worker 副本，POST /synthesize，返回 WAV 字节，最后归还副本。"""
+    st = await supervisor.acquire(model_cfg.id)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(f"{st.base_url}/synthesize", json=payload)
+        if r.status_code != 200:
+            detail = r.json().get("error", r.text) if r.content else "未知错误"
+            raise RuntimeError(str(detail))
+        return r.content
+    finally:
+        supervisor.release(model_cfg.id, st)
 
 
 # ---- 内置 agent（协调端进程内，无 HTTP）-------------------------------------
@@ -61,11 +64,11 @@ class EmbeddedAgent:
         await asyncio.to_thread(
             cluster.register_node, node_id=c.node_id, name=c.node_name,
             role="coordinator", models=self._allowed_models(),
-            max_concurrency=c.max_concurrency, version="1.0.0",
+            max_concurrency=self.state.supervisor.total_slots(), version="1.0.0",
         )
         while not self._stop:
             c = self._cluster_cfg
-            capacity = max(0, c.max_concurrency - self._inflight)
+            capacity = max(0, self.state.supervisor.total_slots() - self._inflight)
             jobs = []
             if capacity > 0:
                 jobs = await asyncio.to_thread(
@@ -118,7 +121,7 @@ async def _remote_main() -> None:
     async def register(client: httpx.AsyncClient) -> None:
         await client.post(f"{base}/v1/cluster/register", headers=headers, json={
             "node_id": c.node_id, "name": c.node_name, "role": "agent",
-            "models": models, "max_concurrency": c.max_concurrency, "version": "1.0.0",
+            "models": models, "max_concurrency": supervisor.total_slots(), "version": "1.0.0",
         })
 
     async def fetch_asset(client: httpx.AsyncClient, voice: str) -> str:
@@ -172,7 +175,7 @@ async def _remote_main() -> None:
                 backoff = min(backoff * 2, 30)
                 continue
             while True:
-                capacity = max(0, c.max_concurrency - inflight)
+                capacity = max(0, supervisor.total_slots() - inflight)
                 jobs = []
                 if capacity > 0:
                     try:

@@ -63,6 +63,7 @@ class ModelConfig:
     port: int = 0
     languages: list[str] = field(default_factory=list)
     supports_cloning: bool = False
+    replicas: int = 1                                        # 同模型并行 worker 进程数
     options: dict[str, Any] = field(default_factory=dict)
     placement: dict[str, Any] = field(default_factory=dict)  # {allow: [node_id,...]}
 

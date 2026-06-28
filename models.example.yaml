@@ -25,6 +25,9 @@ settings:
     node_timeout: 60
     coordinator_runs_jobs: true  # 协调端是否也跑推理(false=只协调)
 models:
+# 注意 replicas：单个 worker 进程内部是串行的（GIL + 单 GPU 队列），真正的并行靠
+# 同模型多开几个进程。replicas=N 会占用 port..port+N-1 这 N 个端口（所以各模型端口要留出间隔）。
+# 经验：单卡 2 副本≈1.5×、3-4 副本≈2-2.5×（受显存/GPU 争用限制）。一个 CosyVoice ~2.6GB 显存/内存。
 - id: system                   # macOS 'say'；非 macOS 节点请设 enabled:false
   enabled: true
   description: macOS 'say' 引擎（仅供本地联调/测试，不支持声音克隆）
@@ -34,13 +37,15 @@ models:
   port: 8101
   languages: [zh, ja, en]
   supports_cloning: false
+  replicas: 1
 - id: cosyvoice3
   enabled: true
   description: Fun-CosyVoice3-0.5B-2512 零样本多语种声音克隆 TTS
   python: ''                   # 改成本机：/Users/.../envs/vg-cosyvoice/bin/python 或 Windows 的 python.exe
   backend: workers.cosyvoice3.backend:CosyVoice3Backend
   host: 127.0.0.1
-  port: 8102
+  port: 8110                    # 副本用 8110/8111/...；与其它模型端口留出间隔
+  replicas: 2                   # 并行 worker 数：Mac 建议 2；GPU 显存够可调 3-4
   languages: [zh, en, ja, ko, de, es, fr, it, ru, yue]
   supports_cloning: true
   options:
@@ -54,7 +59,8 @@ models:
   python: ''                   # 改成本机 vg-f5 的解释器
   backend: workers.f5_tts.backend:F5TTSBackend
   host: 127.0.0.1
-  port: 8103
+  port: 8120
+  replicas: 1                  # GPU 显存够可调大
   languages: [zh, en, ja]
   supports_cloning: true
   options:
