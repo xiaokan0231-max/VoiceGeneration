@@ -117,6 +117,31 @@ export interface ClusterNodeInfo {
   status: string
   version: string | null
   last_seen: string | null
+  started_workers: number | null
+  working_workers: number
+  total_speed: number | null
+  average_speed_30m: number | null
+  samples_30m: number
+  metrics_updated_at: number | null
+  workers: ClusterWorkerInfo[]
+}
+
+export interface ClusterWorkerInfo {
+  id: string
+  model: string
+  index: number
+  port: number
+  started: boolean | null
+  active: boolean
+  job_id: string | null
+  text: string
+  elapsed_seconds: number | null
+  speed: number | null
+  speed_30m: number | null
+  samples_30m: number
+  audio_seconds: number | null
+  inference_seconds: number | null
+  error: string | null
 }
 
 export interface ClusterInfo {

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import subprocess
 
+from .media_tools import media_binary
+
 MEDIA_TYPES = {
     "wav": "audio/wav",
     "mp3": "audio/mpeg",
@@ -25,7 +27,7 @@ def convert(wav_bytes: bytes, fmt: str) -> bytes:
         return wav_bytes
     if fmt not in _FFMPEG_ARGS:
         raise ValueError(f"不支持的格式: {fmt}")
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+    cmd = [media_binary("ffmpeg"), "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
            *_FFMPEG_ARGS[fmt], "pipe:1"]
     proc = subprocess.run(cmd, input=wav_bytes, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE)

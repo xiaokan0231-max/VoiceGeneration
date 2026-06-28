@@ -30,6 +30,14 @@ class WorkerState:
     port: int
     process: subprocess.Popen | None = None
     last_used: float = 0.0
+    current_job_id: str | None = None
+    current_text: str = ""
+    work_started_at: float | None = None
+    last_speed: float | None = None
+    last_audio_seconds: float | None = None
+    last_elapsed_seconds: float | None = None
+    last_finished_at: float | None = None
+    last_error: str | None = None
 
     @property
     def running(self) -> bool:
@@ -67,6 +75,52 @@ class Supervisor:
 
     def available_capacity(self) -> int:
         return sum(q.qsize() for q in self.free.values())
+
+    def begin_work(self, st: WorkerState, job_id: str | None, text: str = "") -> None:
+        st.current_job_id = job_id
+        st.current_text = text[:80]
+        st.work_started_at = time.time()
+        st.last_error = None
+
+    def finish_work(self, st: WorkerState, *, audio_seconds: float | None = None,
+                    elapsed_seconds: float | None = None, error: str | None = None) -> None:
+        if audio_seconds is not None and elapsed_seconds and elapsed_seconds > 0:
+            st.last_speed = audio_seconds / elapsed_seconds
+            st.last_audio_seconds = audio_seconds
+            st.last_elapsed_seconds = elapsed_seconds
+        st.last_finished_at = time.time()
+        st.last_error = error
+        st.current_job_id = None
+        st.current_text = ""
+        st.work_started_at = None
+
+    def runtime_metrics(self) -> dict:
+        """Return serializable per-worker state for cluster reporting."""
+        now = time.time()
+        workers = []
+        for model_id, pool in self.pools.items():
+            for st in pool:
+                active = st.current_job_id is not None
+                workers.append({
+                    "id": f"{model_id}#{st.index + 1}", "model": model_id,
+                    "index": st.index + 1, "port": st.port,
+                    "started": st.running or active, "active": active,
+                    "job_id": st.current_job_id, "text": st.current_text,
+                    "elapsed_seconds": round(now - st.work_started_at, 1)
+                    if active and st.work_started_at else None,
+                    "speed": round(st.last_speed, 4) if st.last_speed is not None else None,
+                    "audio_seconds": st.last_audio_seconds,
+                    "inference_seconds": st.last_elapsed_seconds,
+                    "last_finished_at": st.last_finished_at, "error": st.last_error,
+                })
+        active = [worker for worker in workers if worker["active"]]
+        speeds = [worker["speed"] for worker in active if worker["speed"] is not None]
+        return {
+            "started_workers": sum(1 for worker in workers if worker["started"]),
+            "working_workers": len(active),
+            "total_speed": round(sum(speeds), 4) if speeds else None,
+            "workers": workers, "updated_at": now,
+        }
 
     # ---- 执行路径：取/还一个空闲副本 -----------------------------------
     async def acquire(self, model_id: str) -> WorkerState:
@@ -175,15 +229,29 @@ class Supervisor:
         st.last_used = time.time()  # 立刻打时间戳，避免回收器在启动期误杀
 
     def _stop(self, st: WorkerState) -> None:
-        if st.process and st.process.poll() is None:
+        process = st.process
+        if process and process.poll() is None:
             try:
                 if os.name == "nt":
-                    st.process.terminate()
+                    process.terminate()
                 else:
-                    os.killpg(os.getpgid(st.process.pid), signal.SIGTERM)
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
             except (AttributeError, ProcessLookupError, PermissionError):
-                st.process.terminate()
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    if os.name == "nt":
+                        process.kill()
+                    else:
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    process.wait(timeout=2)
+                except (AttributeError, ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
+                    pass
         st.process = None
+        if st.current_job_id is not None:
+            self.finish_work(st, error="worker 已停止")
 
     async def _wait_healthy(self, st: WorkerState) -> None:
         url = f"{st.base_url}/health"

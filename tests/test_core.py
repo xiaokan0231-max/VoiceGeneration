@@ -6,12 +6,16 @@ from sqlalchemy import delete
 
 from gateway import cluster
 from gateway.cache import AudioCache
+from gateway.audio import convert
+from gateway.media_tools import media_binary
 from gateway.database import (
     ClusterNode, GenerationHistory, Project, create_project, db_session,
     delete_generation, delete_project, finish_generation, init_database,
     list_generations, list_projects, new_generation, set_generation_project,
 )
 from gateway.schemas import TTSRequest
+from gateway.config import ModelConfig, Settings
+from gateway.supervisor import Supervisor
 
 
 @pytest.fixture(autouse=True)
@@ -42,6 +46,26 @@ def test_cache_key_includes_mode_and_eviction_preserves_logs(tmp_path: Path):
     log.parent.mkdir(); log.write_bytes(b"keep me")
     cache.put(clone, "wav", b"123456")
     assert log.read_bytes() == b"keep me"
+
+
+def test_ffmpeg_is_found_with_macos_app_path(monkeypatch):
+    """A .app gets a minimal PATH; Homebrew ffmpeg must still be discovered."""
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    resolved = Path(media_binary("ffmpeg"))
+    assert resolved.is_file() and resolved.name == "ffmpeg"
+
+
+def test_opus_conversion_with_minimal_path(monkeypatch):
+    import io
+    import wave
+
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    stream = io.BytesIO()
+    with wave.open(stream, "wb") as wav:
+        wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(16000)
+        wav.writeframes(b"\0\0" * 1600)
+    opus = convert(stream.getvalue(), "opus")
+    assert opus.startswith(b"OggS")
 
 
 def test_mysql_history_pagination_filter_and_delete():
@@ -152,3 +176,37 @@ def test_cluster_node_registry():
     nodes = cluster.list_nodes()
     assert any(n["node_id"] == "win-4060" and n["models"] == ["cosyvoice3", "f5_tts"] for n in nodes)
     assert cluster.node_name_map().get("win-4060") == "Windows 4060"
+    cluster.update_node_runtime("win-4060", {
+        "workers": [{"id": "cosyvoice3#1", "model": "cosyvoice3", "index": 1,
+                     "port": 8110, "started": True, "active": True, "speed": .42}],
+    })
+    performance = new_generation(
+        text="性能样本", model_id="cosyvoice3", voice_id="qa", voice_name="QA",
+        mode="clone", language="zh", speed=1.0, format="wav", instruct_text=None,
+        cache_key="perf", status="leased", assigned_node="win-4060",
+        worker_id="cosyvoice3#1", attempts=1,
+    )
+    finish_generation(
+        performance.id, status="completed", duration_seconds=10,
+        inference_seconds=20, elapsed_seconds=21,
+    )
+    node = next(item for item in cluster.list_nodes() if item["node_id"] == "win-4060")
+    assert node["started_workers"] == 1
+    assert node["working_workers"] == 1
+    assert node["total_speed"] == pytest.approx(.42)
+    assert node["average_speed_30m"] == pytest.approx(.5)
+    assert node["workers"][0]["speed_30m"] == pytest.approx(.5)
+
+
+def test_supervisor_reports_worker_count_and_realtime_speed():
+    supervisor = Supervisor(Settings(), [ModelConfig(id="cosyvoice3", port=8110, replicas=2)])
+    worker = supervisor.pools["cosyvoice3"][0]
+    worker.process = type("Process", (), {"poll": lambda self: None})()
+    supervisor.begin_work(worker, "job-1", "测试文本")
+    supervisor.finish_work(worker, audio_seconds=10, elapsed_seconds=20)
+    supervisor.begin_work(worker, "job-2", "继续测试")
+    metrics = supervisor.runtime_metrics()
+    assert metrics["started_workers"] == 1
+    assert metrics["working_workers"] == 1
+    assert metrics["total_speed"] == pytest.approx(.5)
+    assert metrics["workers"][0]["speed"] == pytest.approx(.5)

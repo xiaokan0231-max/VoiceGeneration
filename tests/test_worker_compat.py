@@ -19,6 +19,12 @@ class FakeProcess:
     def terminate(self):
         self.terminated = True
 
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        self.terminated = True
+
 
 def test_supervisor_terminates_worker_on_windows(monkeypatch):
     supervisor = Supervisor(Settings(), [ModelConfig(id="f5_tts")])

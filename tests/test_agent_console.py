@@ -63,7 +63,7 @@ def test_full_agent_still_polls_lease_to_keep_node_online():
     async def scenario():
         agent = _agent_for_cluster_test()
         agent.active = {"active-job": {}}
-        agent.supervisor = SimpleNamespace(total_slots=lambda: 1)
+        agent.supervisor = SimpleNamespace(total_slots=lambda: 1, runtime_metrics=lambda: {"workers": []})
         calls = []
 
         class FakeResponse:
@@ -88,6 +88,7 @@ def test_full_agent_still_polls_lease_to_keep_node_online():
     assert len(calls) == 1
     assert calls[0][0].endswith("/v1/cluster/lease")
     assert calls[0][1]["json"]["capacity"] == 0
+    assert "metrics" in calls[0][1]["json"]
 
 
 def test_active_job_renews_its_lease(monkeypatch):

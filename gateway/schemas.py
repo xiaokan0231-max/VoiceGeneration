@@ -81,6 +81,7 @@ class ClusterLease(BaseModel):
     node_id: str
     models: list[str] = Field(default_factory=list)
     capacity: int = 1
+    metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 class JobFail(BaseModel):

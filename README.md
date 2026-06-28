@@ -84,7 +84,8 @@ bash scripts/setup_gateway.sh
 bash scripts/start.sh                       # → http://127.0.0.1:8080
 
 # B) 双击 VoiceGeneration.app（scripts/launcher.py）：
-#    自动确保 Homebrew MySQL 在跑 → 迁移 → 复用或启动网关 → 打开浏览器。
+#    自动确保 Homebrew MySQL 在跑 → 若已有实例则优雅停止网关和全部 worker
+#    → 迁移 → 启动新实例 → 打开浏览器。
 #    PID/日志在 cache/_logs/（gateway.log / gateway.pid / launcher.log）。
 ```
 

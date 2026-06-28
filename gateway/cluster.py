@@ -6,12 +6,64 @@
 from __future__ import annotations
 
 import json
+import math
+import threading
+import time
 from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import func, select, update
 
 from .database import ClusterNode, GenerationHistory, _utcnow, db_session
+
+
+_runtime_lock = threading.Lock()
+_node_runtime: dict[str, dict[str, Any]] = {}
+
+
+def update_node_runtime(node_id: str, metrics: dict[str, Any] | None) -> None:
+    """Store transient worker metrics reported by a node (never persisted as history)."""
+    if not metrics:
+        return
+    workers = []
+    for raw in list(metrics.get("workers") or [])[:64]:
+        if not isinstance(raw, dict):
+            continue
+        speed = raw.get("speed")
+        try:
+            speed = float(speed) if speed is not None and math.isfinite(float(speed)) else None
+        except (TypeError, ValueError):
+            speed = None
+        workers.append({
+            "id": str(raw.get("id") or "worker")[:128],
+            "model": str(raw.get("model") or "")[:64],
+            "index": int(raw.get("index") or 0),
+            "port": int(raw.get("port") or 0),
+            "started": bool(raw.get("started")),
+            "active": bool(raw.get("active")),
+            "job_id": str(raw.get("job_id") or "")[:36] or None,
+            "text": str(raw.get("text") or "")[:80],
+            "elapsed_seconds": raw.get("elapsed_seconds"),
+            "speed": round(max(0.0, min(speed, 100.0)), 4) if speed is not None else None,
+            "audio_seconds": raw.get("audio_seconds"),
+            "inference_seconds": raw.get("inference_seconds"),
+            "error": str(raw.get("error") or "")[:300] or None,
+        })
+    active_speeds = [worker["speed"] for worker in workers if worker["active"] and worker["speed"] is not None]
+    snapshot = {
+        "started_workers": sum(1 for worker in workers if worker["started"]),
+        "working_workers": sum(1 for worker in workers if worker["active"]),
+        "total_speed": round(sum(active_speeds), 4) if active_speeds else None,
+        "workers": workers,
+        "metrics_updated_at": time.time(),
+    }
+    with _runtime_lock:
+        _node_runtime[node_id] = snapshot
+
+
+def _runtime_snapshot(node_id: str) -> dict[str, Any]:
+    with _runtime_lock:
+        return dict(_node_runtime.get(node_id, {}))
 
 
 # ---- 任务队列 ---------------------------------------------------------------
@@ -224,7 +276,87 @@ def node_dict(row: ClusterNode) -> dict[str, Any]:
 def list_nodes() -> list[dict[str, Any]]:
     with db_session() as db:
         rows = list(db.scalars(select(ClusterNode).order_by(ClusterNode.created_at.asc())))
-        return [node_dict(r) for r in rows]
+        active_counts = {
+            node_id: int(count)
+            for node_id, count in db.execute(
+                select(GenerationHistory.assigned_node, func.count())
+                .where(
+                    GenerationHistory.status == "leased",
+                    GenerationHistory.assigned_node.is_not(None),
+                )
+                .group_by(GenerationHistory.assigned_node)
+            )
+        }
+        # Weighted 30-minute performance: sum(audio seconds) / sum(inference seconds).
+        # New records are grouped by exact worker_id; legacy rows still provide a node average.
+        elapsed = func.coalesce(
+            GenerationHistory.inference_seconds, GenerationHistory.elapsed_seconds,
+        )
+        performance: dict[str, dict[str, Any]] = {}
+        for node_id, worker_id, audio_sum, elapsed_sum, samples in db.execute(
+            select(
+                GenerationHistory.assigned_node, GenerationHistory.worker_id,
+                func.sum(GenerationHistory.duration_seconds), func.sum(elapsed), func.count(),
+            )
+            .where(
+                GenerationHistory.status == "completed",
+                GenerationHistory.assigned_node.is_not(None),
+                GenerationHistory.completed_at >= _utcnow() - timedelta(minutes=30),
+                GenerationHistory.duration_seconds.is_not(None),
+                elapsed.is_not(None), elapsed > 0,
+            )
+            .group_by(GenerationHistory.assigned_node, GenerationHistory.worker_id)
+        ):
+            if not node_id or not elapsed_sum:
+                continue
+            entry = performance.setdefault(node_id, {"workers": {}, "legacy": None, "samples": 0})
+            value = float(audio_sum or 0) / float(elapsed_sum)
+            entry["samples"] += int(samples or 0)
+            if worker_id:
+                entry["workers"][worker_id] = {"speed": value, "samples": int(samples or 0)}
+            else:
+                entry["legacy"] = value
+        result = []
+        for row in rows:
+            item = node_dict(row)
+            runtime = _runtime_snapshot(row.node_id)
+            leased = active_counts.get(row.node_id, 0)
+            has_runtime = "working_workers" in runtime
+            perf = performance.get(row.node_id, {"workers": {}, "legacy": None, "samples": 0})
+            workers = runtime.get("workers", [])
+            if not workers and row.max_concurrency == 1 and perf["legacy"] is not None:
+                model_id = item["models"][0] if item["models"] else "worker"
+                workers = [{
+                    "id": f"{model_id}#1", "model": model_id, "index": 1, "port": 0,
+                    "started": None, "active": leased > 0, "job_id": None, "text": "",
+                    "elapsed_seconds": None, "speed": None, "audio_seconds": None,
+                    "inference_seconds": None, "error": None,
+                    "speed_30m": round(perf["legacy"], 4),
+                    "samples_30m": perf["samples"],
+                }]
+            else:
+                for worker in workers:
+                    stats = perf["workers"].get(worker["id"])
+                    worker["speed_30m"] = round(stats["speed"], 4) if stats else None
+                    worker["samples_30m"] = stats["samples"] if stats else 0
+            named_speeds = [stats["speed"] for stats in perf["workers"].values()]
+            average_speed = sum(named_speeds) if named_speeds else perf["legacy"]
+            average_samples = (
+                sum(stats["samples"] for stats in perf["workers"].values())
+                if named_speeds else perf["samples"]
+            )
+            item.update({
+                "started_workers": runtime.get("started_workers"),
+                "working_workers": int(runtime.get("working_workers") or 0)
+                if has_runtime else min(leased, row.max_concurrency),
+                "total_speed": runtime.get("total_speed"),
+                "workers": workers,
+                "metrics_updated_at": runtime.get("metrics_updated_at"),
+                "average_speed_30m": round(average_speed, 4) if average_speed is not None else None,
+                "samples_30m": average_samples,
+            })
+            result.append(item)
+        return result
 
 
 def node_name_map() -> dict[str, str]:

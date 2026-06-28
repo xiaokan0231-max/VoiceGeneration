@@ -4,6 +4,7 @@ import { api } from '../api'
 import type { ClusterInfo, ConnectInfo, RuntimeModel, SettingsInfo, SystemInfo } from '../types'
 
 const bytes = (value: number) => value < 1024 ** 2 ? `${(value / 1024).toFixed(0)} KB` : value < 1024 ** 3 ? `${(value / 1024 ** 2).toFixed(1)} MB` : `${(value / 1024 ** 3).toFixed(2)} GB`
+const speed = (value: number | null, measuring = false) => value == null ? (measuring ? '测量中' : '—') : `${value.toFixed(2)}× 实时`
 
 export default function SettingsPage({ system, onSystemChange }: { system: SystemInfo | null; onSystemChange: () => void }) {
   const [settings, setSettings] = useState<SettingsInfo | null>(null)
@@ -57,11 +58,18 @@ export default function SettingsPage({ system, onSystemChange }: { system: Syste
       <div className="field"><label>启动超时（秒）</label><input type="number" min="30" value={settings.worker_start_timeout} onChange={e => updateSetting('worker_start_timeout', Number(e.target.value))} /></div>
       <div className="field"><label>缓存上限（GB）</label><input type="number" min=".1" step=".1" value={settings.cache_max_gb} onChange={e => updateSetting('cache_max_gb', Number(e.target.value))} /></div>
     </div></section>}
-    {cluster && <section className="settings-section"><div className="settings-title"><div><h2>集群</h2><p>本机：{cluster.self.node_name}（{cluster.self.role}{cluster.self.coordinator_runs_jobs ? ' · 参与生成' : ' · 仅协调'}）· 队列 {cluster.queue_depth} 条待处理</p></div><Network /></div>
+    {cluster && <section className="settings-section"><div className="settings-title"><div><h2>集群</h2><p>本机：{cluster.self.node_name}（{cluster.self.role}{cluster.self.coordinator_runs_jobs ? ' · 参与生成' : ' · 仅协调'}）· 队列 {cluster.queue_depth} 条待处理 · 速度 = 音频时长 ÷ 推理耗时</p></div><Network /></div>
       <div className="node-list">
         {cluster.nodes.map(n => <div className="node-row" key={n.node_id}>
           <span className={`status-dot ${n.status === 'online' ? '' : 'idle'}`} />
-          <div className="node-copy"><h3>{n.name}</h3><small>{n.node_id} · {n.role} · {n.models.join(' / ') || '无模型'} · 并发 {n.max_concurrency}</small></div>
+          <div className="node-copy"><h3>{n.name}</h3><small>{n.node_id} · {n.role} · {n.models.join(' / ') || '无模型'} · 最大并发 {n.max_concurrency}</small>
+            <div className="node-metrics"><span>已启动 <strong>{n.started_workers ?? '—'}/{n.max_concurrency}</strong></span><span className={n.working_workers > 0 ? 'working' : ''}>工作中 <strong>{n.working_workers}</strong></span><span>近 30 分钟总速度 <strong>{speed(n.average_speed_30m)}</strong>{n.samples_30m > 0 && <em>{n.samples_30m} 个样本</em>}</span></div>
+            {n.workers?.length > 0 ? <div className="worker-runtime-list">{n.workers.map(worker => <div className="worker-runtime" key={worker.id}>
+              <span className={`worker-state ${worker.active ? 'active' : worker.started ? 'ready' : ''}`} />
+              <div><strong>{worker.id}</strong><small>{worker.started == null ? worker.active ? '工作中 · 旧版节点' : '状态未上报' : worker.started ? worker.active ? `工作中 · ${Math.round(worker.elapsed_seconds || 0)}s` : '待机' : '未启动'}{worker.port ? ` · :${worker.port}` : ''}</small></div>
+              <span>{worker.samples_30m > 0 ? `近30m ${speed(worker.speed_30m)} · ${worker.samples_30m}次` : worker.active ? '积累样本中' : '暂无样本'}</span>
+            </div>)}</div> : n.working_workers > 0 && <p className="metrics-hint">副节点正在工作；更新副节点程序后可查看每个 worker 的速度。</p>}
+          </div>
           <span className={n.status === 'online' ? 'online' : 'offline'}>{n.status === 'online' ? '在线' : '离线'}</span>
         </div>)}
         {cluster.nodes.length === 0 && <p className="muted">暂无已注册节点</p>}

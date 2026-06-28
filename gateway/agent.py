@@ -7,10 +7,13 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import tempfile
 import time
+import wave
 from collections import deque
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -20,6 +23,14 @@ from fastapi.responses import FileResponse, HTMLResponse
 
 from .config import ROOT, load_config, load_raw_models, save_raw_models
 from .supervisor import Supervisor
+
+
+@dataclass
+class WorkerResult:
+    wav: bytes
+    worker_id: str
+    inference_seconds: float
+    audio_seconds: float | None
 
 
 def connection_state(*, enabled: bool, coordinator_url: str, connected: bool,
@@ -36,18 +47,41 @@ def connection_state(*, enabled: bool, coordinator_url: str, connected: bool,
     return "connecting"
 
 
-async def run_worker(supervisor: Supervisor, model_cfg, payload: dict, timeout: float = 1800) -> bytes:
+async def run_worker(supervisor: Supervisor, model_cfg, payload: dict,
+                     timeout: float = 1800) -> WorkerResult:
     """取一个空闲 worker 副本，POST /synthesize，返回 WAV 字节，最后归还副本。"""
     st = await supervisor.acquire(model_cfg.id)
+    started = time.perf_counter()
+    supervisor.begin_work(st, payload.get("job_id"), payload.get("text") or "")
     try:
+        worker_payload = {key: value for key, value in payload.items() if key != "job_id"}
         async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-            r = await client.post(f"{st.base_url}/synthesize", json=payload)
+            r = await client.post(f"{st.base_url}/synthesize", json=worker_payload)
         if r.status_code != 200:
             detail = r.json().get("error", r.text) if r.content else "未知错误"
             raise RuntimeError(str(detail))
-        return r.content
+        elapsed = time.perf_counter() - started
+        audio_seconds = _wav_duration(r.content)
+        supervisor.finish_work(st, audio_seconds=audio_seconds, elapsed_seconds=elapsed)
+        return WorkerResult(
+            wav=r.content, worker_id=f"{model_cfg.id}#{st.index + 1}",
+            inference_seconds=elapsed, audio_seconds=audio_seconds,
+        )
+    except Exception as exc:
+        supervisor.finish_work(st, error=str(exc))
+        raise
     finally:
         supervisor.release(model_cfg.id, st)
+
+
+def _wav_duration(data: bytes) -> float | None:
+    try:
+        with wave.open(io.BytesIO(data), "rb") as wav:
+            width = wav.getsampwidth() * wav.getnchannels()
+            frames = len(wav.readframes(wav.getnframes())) // width
+            return frames / float(wav.getframerate())
+    except (wave.Error, EOFError, ZeroDivisionError):
+        return None
 
 
 # ---- 内置 agent（协调端进程内，无 HTTP）-------------------------------------
@@ -58,6 +92,7 @@ class EmbeddedAgent:
         self._task: asyncio.Task | None = None
         self._inflight = 0
         self._stop = False
+        self._jobs: set[asyncio.Task] = set()
 
     @property
     def _cluster_cfg(self):
@@ -75,6 +110,10 @@ class EmbeddedAgent:
         self._stop = True
         if self._task:
             self._task.cancel()
+        for task in self._jobs:
+            task.cancel()
+        if self._jobs:
+            await asyncio.gather(*self._jobs, return_exceptions=True)
 
     async def _loop(self) -> None:
         from . import cluster
@@ -93,9 +132,12 @@ class EmbeddedAgent:
                     cluster.lease_jobs, c.node_id, self._allowed_models(), capacity, c.lease_ttl
                 )
             await asyncio.to_thread(cluster.touch_node, c.node_id)
+            cluster.update_node_runtime(c.node_id, self.state.supervisor.runtime_metrics())
             for job in jobs:
                 self._inflight += 1
-                asyncio.create_task(self._run(job))
+                task = asyncio.create_task(self._run(job))
+                self._jobs.add(task)
+                task.add_done_callback(self._jobs.discard)
             await asyncio.sleep(0.05 if jobs else max(0.25, c.poll_interval))
 
     async def _run(self, job: dict) -> None:
@@ -108,8 +150,12 @@ class EmbeddedAgent:
             if not model or not model.enabled:
                 raise RuntimeError(f"模型未启用: {job['model']}")
             payload = state.build_payload(job)
-            wav = await run_worker(state.supervisor, model, payload)
-            await state.finalize_job(job["id"], wav, time.perf_counter() - started, c.node_id)
+            payload["job_id"] = job["id"]
+            result = await run_worker(state.supervisor, model, payload)
+            await state.finalize_job(
+                job["id"], result.wav, time.perf_counter() - started, c.node_id,
+                worker_id=result.worker_id, inference_seconds=result.inference_seconds,
+            )
         except Exception as exc:  # noqa: BLE001
             await asyncio.to_thread(cluster.fail_or_requeue, job["id"], str(exc), c.max_attempts)
         finally:
@@ -219,7 +265,8 @@ class RemoteAgent:
             try:
                 r = await self._client.post(
                     f"{self.base}/v1/cluster/lease", headers=self.headers,
-                    json={"node_id": self.cluster.node_id, "models": self._models(), "capacity": capacity},
+                    json={"node_id": self.cluster.node_id, "models": self._models(),
+                          "capacity": capacity, "metrics": self.supervisor.runtime_metrics()},
                     timeout=40,
                 )
                 r.raise_for_status()
@@ -279,12 +326,18 @@ class RemoteAgent:
                 "speed": job.get("speed", 1.0), "mode": job.get("mode", "clone"),
                 "instruct_text": job.get("instruct_text"),
                 "ref_audio_path": ref_audio_path, "ref_text": job.get("ref_text"),
+                "job_id": jid,
             }
-            wav = await run_worker(self.supervisor, model, payload)
+            worker_result = await run_worker(self.supervisor, model, payload)
             result = await self._client.post(
                 f"{self.base}/v1/cluster/jobs/{jid}/result", headers=self.headers,
-                files={"audio": ("out.wav", wav, "audio/wav")},
-                data={"node_id": self.cluster.node_id, "elapsed": str(time.perf_counter() - started)},
+                files={"audio": ("out.wav", worker_result.wav, "audio/wav")},
+                data={
+                    "node_id": self.cluster.node_id,
+                    "elapsed": str(time.perf_counter() - started),
+                    "worker_id": worker_result.worker_id,
+                    "inference_seconds": str(worker_result.inference_seconds),
+                },
             )
             result.raise_for_status()
             self.status["counters"]["completed"] += 1

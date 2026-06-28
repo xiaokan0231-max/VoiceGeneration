@@ -45,6 +45,8 @@ class GenerationHistory(Base):
     status: Mapped[str] = mapped_column(String(24), nullable=False, index=True)
     # 集群任务字段（单机时 assigned_node 即本机 node_id）
     assigned_node: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    inference_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -227,6 +229,7 @@ def history_dict(row: GenerationHistory, project_name: str | None = None,
         "project_id": row.project_id,
         "project_name": project_name,
         "assigned_node": row.assigned_node,
+        "worker_id": row.worker_id,
         "node_name": node_name or row.assigned_node,
         "mode": row.mode,
         "language": row.language,
@@ -238,6 +241,7 @@ def history_dict(row: GenerationHistory, project_name: str | None = None,
         "byte_size": row.byte_size,
         "cache_hit": row.cache_hit,
         "elapsed_seconds": row.elapsed_seconds,
+        "inference_seconds": row.inference_seconds,
         "error_message": row.error_message,
         "audio_available": audio_file(row) is not None,
         "created_at": row.created_at.isoformat() + "Z",
@@ -334,4 +338,3 @@ def set_generation_project(gen_id: str, project_id: str | None) -> bool:
         row.project_id = project_id
         db.commit()
         return True
-

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 import platform
 import signal
@@ -23,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text as sql_text
 
 from .audio import convert, media_type
+from .media_tools import media_binary
 from .cache import AudioCache
 from .config import (
     ROOT, AppConfig, Voice, load_config, load_raw_models, save_raw_models,
@@ -41,6 +43,9 @@ from .schemas import (
 )
 from .supervisor import Supervisor
 from .voice_store import create_voice, delete_voice, update_voice
+
+
+logger = logging.getLogger(__name__)
 
 
 class App:
@@ -89,7 +94,10 @@ class App:
             "ref_audio_path": ref_audio_path, "ref_text": ref_text,
         }
 
-    async def finalize_job(self, job_id: str, wav_bytes: bytes, elapsed: float, node_id: str) -> None:
+    async def finalize_job(
+        self, job_id: str, wav_bytes: bytes, elapsed: float, node_id: str,
+        *, worker_id: str | None = None, inference_seconds: float | None = None,
+    ) -> None:
         """协调端落地结果：转码→入缓存→更新历史→去重（阻塞操作放线程池）。"""
         row = await asyncio.to_thread(get_generation, job_id)
         if not row:
@@ -103,6 +111,7 @@ class App:
         mt = media_type(fmt)
         await asyncio.to_thread(
             finish_generation, job_id, status="completed", assigned_node=node_id,
+            worker_id=worker_id, inference_seconds=inference_seconds,
             audio_path=rel, mime_type=mt, byte_size=len(data),
             duration_seconds=dur, cache_hit=False, elapsed_seconds=elapsed,
             lease_expires_at=None,
@@ -195,7 +204,7 @@ def _duration_from_wav(data: bytes) -> float | None:
 def _duration_from_file(path: Path) -> float | None:
     try:
         proc = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+            [media_binary("ffprobe"), "-v", "error", "-show_entries", "format=duration",
              "-of", "default=nw=1:nk=1", str(path)],
             capture_output=True, text=True, timeout=10, check=True,
         )
@@ -736,6 +745,9 @@ async def cluster_lease(body: ClusterLease, request: Request,
         if (mc := cfg.model(m)) and mc.enabled and mc.allows(body.node_id)
     ]
     await asyncio.to_thread(cluster.touch_node, body.node_id)
+    cluster.update_node_runtime(body.node_id, body.metrics)
+    if body.capacity <= 0:
+        return {"jobs": []}
     deadline = time.monotonic() + 25  # 长轮询
     while True:
         jobs = await asyncio.to_thread(
@@ -761,12 +773,23 @@ async def cluster_asset(voice_id: str, request: Request,
 @app.post("/v1/cluster/jobs/{job_id}/result")
 async def cluster_job_result(job_id: str, request: Request,
                              node_id: str = Form(...), elapsed: float = Form(0.0),
+                             worker_id: str | None = Form(None),
+                             inference_seconds: float | None = Form(None),
                              audio: UploadFile = File(...),
                              authorization: str | None = Depends(check_auth)):
     state = get_state(request)
     _require_cluster(state, authorization)
     wav = await audio.read()
-    await state.finalize_job(job_id, wav, elapsed, node_id)
+    if not wav:
+        raise HTTPException(400, "副节点上传的音频为空")
+    try:
+        await state.finalize_job(
+            job_id, wav, elapsed, node_id,
+            worker_id=worker_id, inference_seconds=inference_seconds,
+        )
+    except Exception as exc:
+        logger.exception("处理副节点结果失败 job=%s node=%s", job_id, node_id)
+        raise HTTPException(500, f"主节点处理音频结果失败：{exc}") from exc
     return {"ok": True}
 
 

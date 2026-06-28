@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 
 from worker_runtime.base import SynthRequest, TTSBackend
+from gateway.media_tools import media_binary
 
 # 内置音色（macOS 系统自带语音；可用 `say -v '?'` 查看更多）
 VOICES = [
@@ -46,7 +47,7 @@ class SystemBackend(TTSBackend):
             )
             # 转成 16k 单声道 wav 字节
             proc = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                [media_binary("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y",
                  "-i", str(aiff), "-ar", "16000", "-ac", "1", "-f", "wav", "pipe:1"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )

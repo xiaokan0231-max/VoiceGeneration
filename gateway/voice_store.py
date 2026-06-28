@@ -13,6 +13,7 @@ from typing import Any
 import yaml
 
 from .config import ROOT, Voice
+from .media_tools import media_binary
 
 
 VOICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{2,64}$")
@@ -43,7 +44,7 @@ def _save_raw(raw: dict[str, Any]) -> None:
 
 def _duration(path: Path) -> float:
     proc = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+        [media_binary("ffprobe"), "-v", "error", "-show_entries", "format=duration",
          "-of", "default=nw=1:nk=1", str(path)],
         capture_output=True, text=True, check=True,
     )
@@ -60,7 +61,7 @@ def _normalize_audio(data: bytes, destination: Path) -> float:
         # 只修剪【开头】的静音/死区（麦克风预热、点录后停顿），保留至多 0.05s 自然留白。
         # 注意：不剪结尾——F5-TTS 需要参考音频末尾留有静音，否则结尾易被截断。
         proc = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
+            [media_binary("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
              "-af", "silenceremove=start_periods=1:start_silence=0.05:start_threshold=-50dB:detection=peak",
              "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(destination)],
             capture_output=True,
@@ -131,4 +132,3 @@ def delete_voice(voice_id: str) -> bool:
     if folder.parent == (ROOT / "voices").resolve():
         shutil.rmtree(folder, ignore_errors=True)
     return True
-

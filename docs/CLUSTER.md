@@ -78,6 +78,13 @@ settings:
 - 任一条生成的响应头 `X-Node` / 历史「由 X 生成」标明实际执行节点。
 - 合成中途关掉 Windows agent → 该任务租约到期后被另一台接手完成，不丢不重复。
 
+## 性能统计
+
+- 设置页会显示每个节点的已启动 worker、正在工作的 worker，以及每个 worker 和节点的最近 30 分钟平均速度。
+- 速度 = `生成音频时长 ÷ 推理耗时`。例如 `0.8×` 表示生成 10 秒音频约需 12.5 秒；节点总速度是各 worker 加权平均速度之和。
+- 数据直接汇总 MySQL 中已经完成的历史任务，不会发起额外推理，也不会占用 worker。新版本会记录精确的 `worker_id` 和纯推理耗时；旧历史仍可作为节点级平均值使用。
+- Windows 副节点要显示精确的实时工作数和逐 worker 性能，需要同步新版 `gateway/agent.py`、`gateway/supervisor.py` 后重启 agent；旧 agent 仍会显示由租约推算的工作数和节点历史平均速度。
+
 ## 让 Mac 只协调、把活全交给 Windows
 
 把 Mac 的 `settings.cluster.coordinator_runs_jobs` 设为 `false` 并重启网关。此时 Mac 不跑推理，
