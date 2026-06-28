@@ -1,10 +1,14 @@
 import { useEffect, useState } from 'react'
 import { Copy, Cpu, Database, HardDrive, LoaderCircle, Network, Play, Power, RefreshCw, Save, Server, Square } from 'lucide-react'
 import { api } from '../api'
-import type { ClusterInfo, ConnectInfo, RuntimeModel, SettingsInfo, SystemInfo } from '../types'
+import type { ClusterInfo, ClusterWorkerInfo, ConnectInfo, RuntimeModel, SettingsInfo, SystemInfo } from '../types'
 
 const bytes = (value: number) => value < 1024 ** 2 ? `${(value / 1024).toFixed(0)} KB` : value < 1024 ** 3 ? `${(value / 1024 ** 2).toFixed(1)} MB` : `${(value / 1024 ** 3).toFixed(2)} GB`
 const speed = (value: number | null, measuring = false) => value == null ? (measuring ? '测量中' : '—') : `${value.toFixed(2)}× 实时`
+const slotSummary = (workers: ClusterWorkerInfo[]) => {
+  const counts = workers.reduce<Record<string, number>>((all, worker) => ({ ...all, [worker.model]: (all[worker.model] || 0) + 1 }), {})
+  return Object.entries(counts).map(([model, count]) => `${model} ${count}槽`).join(' · ')
+}
 
 export default function SettingsPage({ system, onSystemChange }: { system: SystemInfo | null; onSystemChange: () => void }) {
   const [settings, setSettings] = useState<SettingsInfo | null>(null)
@@ -32,7 +36,7 @@ export default function SettingsPage({ system, onSystemChange }: { system: Syste
   }
   const saveModel = async (model: RuntimeModel) => {
     setBusy(`save-${model.id}`); setError('')
-    try { await api.saveModel(model.id, { enabled: model.enabled, python: model.python, port: Number(model.port), options: model.options }); setMessage(`${model.id} 配置已保存`); await load(); onSystemChange() }
+    try { await api.saveModel(model.id, { enabled: model.enabled, python: model.python, port: Number(model.port), replicas: Number(model.replicas), options: model.options }); setMessage(`${model.id} 配置已保存`); await load(); onSystemChange() }
     catch (e) { setError(e instanceof Error ? e.message : '保存失败') } finally { setBusy('') }
   }
   const action = async (model: RuntimeModel, name: 'start' | 'stop' | 'restart') => {
@@ -58,11 +62,11 @@ export default function SettingsPage({ system, onSystemChange }: { system: Syste
       <div className="field"><label>启动超时（秒）</label><input type="number" min="30" value={settings.worker_start_timeout} onChange={e => updateSetting('worker_start_timeout', Number(e.target.value))} /></div>
       <div className="field"><label>缓存上限（GB）</label><input type="number" min=".1" step=".1" value={settings.cache_max_gb} onChange={e => updateSetting('cache_max_gb', Number(e.target.value))} /></div>
     </div></section>}
-    {cluster && <section className="settings-section"><div className="settings-title"><div><h2>集群</h2><p>本机：{cluster.self.node_name}（{cluster.self.role}{cluster.self.coordinator_runs_jobs ? ' · 参与生成' : ' · 仅协调'}）· 队列 {cluster.queue_depth} 条待处理 · 速度 = 音频时长 ÷ 推理耗时</p></div><Network /></div>
+    {cluster && <section className="settings-section"><div className="settings-title"><div><h2>集群</h2><p>本机：{cluster.self.node_name}（{cluster.self.role}{cluster.self.coordinator_runs_jobs ? ' · 参与生成' : ' · 仅协调'}）· 队列 {cluster.queue_depth} 条待处理 · 实际并行数由对应模型槽位决定 · 速度 = 音频时长 ÷ 推理耗时</p></div><Network /></div>
       <div className="node-list">
         {cluster.nodes.map(n => <div className="node-row" key={n.node_id}>
           <span className={`status-dot ${n.status === 'online' ? '' : 'idle'}`} />
-          <div className="node-copy"><h3>{n.name}</h3><small>{n.node_id} · {n.role} · {n.models.join(' / ') || '无模型'} · 最大并发 {n.max_concurrency}</small>
+          <div className="node-copy"><h3>{n.name}</h3><small>{n.node_id} · {n.role} · 总槽位 {n.max_concurrency}{n.workers?.length ? ` · ${slotSummary(n.workers)}` : ''}</small>
             <div className="node-metrics"><span>已启动 <strong>{n.started_workers ?? '—'}/{n.max_concurrency}</strong></span><span className={n.working_workers > 0 ? 'working' : ''}>工作中 <strong>{n.working_workers}</strong></span><span>近 30 分钟总速度 <strong>{speed(n.average_speed_30m)}</strong>{n.samples_30m > 0 && <em>{n.samples_30m} 个样本</em>}</span></div>
             {n.workers?.length > 0 ? <div className="worker-runtime-list">{n.workers.map(worker => <div className="worker-runtime" key={worker.id}>
               <span className={`worker-state ${worker.active ? 'active' : worker.started ? 'ready' : ''}`} />
@@ -89,7 +93,7 @@ export default function SettingsPage({ system, onSystemChange }: { system: Syste
     <section className="settings-section"><div className="settings-title"><div><h2>模型服务</h2><p>保存配置后会安全重载；启动模型可能需要几十秒</p></div></div>
       {models.map(model => <div className="model-config" key={model.id}>
         <div className="model-config-head"><div><span className={`status-dot ${model.loaded ? '' : 'idle'}`} /><h3>{model.id}</h3><span>{model.description}</span></div><label className="switch"><input type="checkbox" checked={model.enabled} onChange={e => updateModel(model.id, { enabled: e.target.checked })} /><span /></label></div>
-        <div className="settings-form model-form"><div className="field span-two"><label>Python 路径</label><input value={model.python} onChange={e => updateModel(model.id, { python: e.target.value })} /></div><div className="field"><label>端口</label><input type="number" value={model.port} onChange={e => updateModel(model.id, { port: Number(e.target.value) })} /></div><div className="field"><label>设备</label><select value={String(model.options.device || 'auto')} onChange={e => updateOption(model.id, 'device', e.target.value)}><option value="auto">auto</option><option value="cuda">cuda</option><option value="mps">mps</option><option value="cpu">cpu</option></select></div>{model.options.model_dir !== undefined && <div className="field span-two"><label>模型目录</label><input value={String(model.options.model_dir)} onChange={e => updateOption(model.id, 'model_dir', e.target.value)} /></div>}{model.options.repo_dir !== undefined && <div className="field span-two"><label>代码目录</label><input value={String(model.options.repo_dir)} onChange={e => updateOption(model.id, 'repo_dir', e.target.value)} /></div>}</div>
+        <div className="settings-form model-form"><div className="field span-two"><label>Python 路径</label><input value={model.python} onChange={e => updateModel(model.id, { python: e.target.value })} /></div><div className="field"><label>起始端口</label><input type="number" value={model.port} onChange={e => updateModel(model.id, { port: Number(e.target.value) })} /></div><div className="field"><label>Worker 副本</label><input type="number" min="1" max="8" value={model.replicas} onChange={e => updateModel(model.id, { replicas: Number(e.target.value) })} /></div><div className="field"><label>设备</label><select value={String(model.options.device || 'auto')} onChange={e => updateOption(model.id, 'device', e.target.value)}><option value="auto">auto</option><option value="cuda">cuda</option><option value="mps">mps</option><option value="cpu">cpu</option></select></div>{model.options.model_dir !== undefined && <div className="field span-two"><label>模型目录</label><input value={String(model.options.model_dir)} onChange={e => updateOption(model.id, 'model_dir', e.target.value)} /></div>}{model.options.repo_dir !== undefined && <div className="field span-two"><label>代码目录</label><input value={String(model.options.repo_dir)} onChange={e => updateOption(model.id, 'repo_dir', e.target.value)} /></div>}</div>
         <div className="model-actions"><button onClick={() => action(model, 'start')} disabled={!model.enabled || Boolean(busy)}><Play />启动</button><button onClick={() => action(model, 'stop')} disabled={Boolean(busy)}><Square />停止</button><button onClick={() => action(model, 'restart')} disabled={!model.enabled || Boolean(busy)}><RefreshCw />重启</button><button className="save-model" onClick={() => saveModel(model)} disabled={Boolean(busy)}>{busy === `save-${model.id}` ? <LoaderCircle className="spin" /> : <Save />}保存配置</button></div>
       </div>)}
     </section>

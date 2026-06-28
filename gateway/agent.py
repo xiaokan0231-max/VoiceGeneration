@@ -11,7 +11,7 @@ import io
 import tempfile
 import time
 import wave
-from collections import deque
+from collections import Counter, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -90,7 +90,7 @@ class EmbeddedAgent:
     def __init__(self, state) -> None:
         self.state = state              # gateway.main.App
         self._task: asyncio.Task | None = None
-        self._inflight = 0
+        self._inflight_by_model: Counter[str] = Counter()
         self._stop = False
         self._jobs: set[asyncio.Task] = set()
 
@@ -125,16 +125,20 @@ class EmbeddedAgent:
         )
         while not self._stop:
             c = self._cluster_cfg
-            capacity = max(0, self.state.supervisor.total_slots() - self._inflight)
+            capacities = {
+                model_id: max(0, slots - self._inflight_by_model[model_id])
+                for model_id, slots in self.state.supervisor.slots_by_model().items()
+                if model_id in self._allowed_models()
+            }
             jobs = []
-            if capacity > 0:
+            if any(capacities.values()):
                 jobs = await asyncio.to_thread(
-                    cluster.lease_jobs, c.node_id, self._allowed_models(), capacity, c.lease_ttl
+                    cluster.lease_jobs_by_model, c.node_id, capacities, c.lease_ttl
                 )
             await asyncio.to_thread(cluster.touch_node, c.node_id)
             cluster.update_node_runtime(c.node_id, self.state.supervisor.runtime_metrics())
             for job in jobs:
-                self._inflight += 1
+                self._inflight_by_model[job["model"]] += 1
                 task = asyncio.create_task(self._run(job))
                 self._jobs.add(task)
                 task.add_done_callback(self._jobs.discard)
@@ -145,6 +149,7 @@ class EmbeddedAgent:
         state = self.state
         c = self._cluster_cfg
         started = time.perf_counter()
+        heartbeat = asyncio.create_task(self._job_heartbeat(job["id"]))
         try:
             model = state.config.model(job["model"])
             if not model or not model.enabled:
@@ -159,7 +164,26 @@ class EmbeddedAgent:
         except Exception as exc:  # noqa: BLE001
             await asyncio.to_thread(cluster.fail_or_requeue, job["id"], str(exc), c.max_attempts)
         finally:
-            self._inflight -= 1
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+            model_id = job["model"]
+            self._inflight_by_model[model_id] -= 1
+            if self._inflight_by_model[model_id] <= 0:
+                del self._inflight_by_model[model_id]
+
+    async def _job_heartbeat(self, job_id: str) -> None:
+        """Keep slow local MPS jobs leased just like remote-agent jobs."""
+        from . import cluster
+        interval = max(5.0, min(30.0, self._cluster_cfg.lease_ttl / 3))
+        while not self._stop:
+            await asyncio.sleep(interval)
+            if self._stop:
+                return
+            ok = await asyncio.to_thread(
+                cluster.extend_lease, job_id, self._cluster_cfg.lease_ttl,
+            )
+            if not ok:
+                return
 
 
 # ---- 远程 agent（独立进程 + 本地 web 控制台：python -m gateway.agent）--------
@@ -257,7 +281,24 @@ class RemoteAgent:
     async def _lease_loop(self, url: str) -> None:
         while (not self._stop and not self.reconnect.is_set()
                and self.enabled and self.cluster.coordinator_url == url):
-            capacity = max(0, self.supervisor.total_slots() - len(self.active))
+            active_by_model = Counter(
+                str(job.get("model")) for job in self.active.values() if job.get("model")
+            )
+            capacities = {
+                model_id: max(0, slots - active_by_model[model_id])
+                for model_id, slots in self.supervisor.slots_by_model().items()
+                if model_id in self._models()
+            }
+            # Defensive fallback for an active job created by an older agent
+            # version without a model field: it still consumes one global slot.
+            unknown_active = max(0, len(self.active) - sum(active_by_model.values()))
+            for model_id in sorted(capacities):
+                reduction = min(unknown_active, capacities[model_id])
+                capacities[model_id] -= reduction
+                unknown_active -= reduction
+                if unknown_active <= 0:
+                    break
+            capacity = sum(capacities.values())
             jobs: list[dict] = []
             # capacity=0 也必须继续长轮询：协调端会在 lease 入口更新
             # node.last_seen。否则节点满载执行长任务时会被 node_timeout
@@ -266,7 +307,8 @@ class RemoteAgent:
                 r = await self._client.post(
                     f"{self.base}/v1/cluster/lease", headers=self.headers,
                     json={"node_id": self.cluster.node_id, "models": self._models(),
-                          "capacity": capacity, "metrics": self.supervisor.runtime_metrics()},
+                          "capacity": capacity, "capacities": capacities,
+                          "metrics": self.supervisor.runtime_metrics()},
                     timeout=40,
                 )
                 r.raise_for_status()

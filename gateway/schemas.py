@@ -48,6 +48,7 @@ class ModelConfigUpdate(BaseModel):
     description: str | None = Field(None, max_length=500)
     python: str | None = None
     port: int | None = Field(None, ge=1024, le=65535)
+    replicas: int | None = Field(None, ge=1, le=8)
     languages: list[str] | None = None
     options: dict[str, Any] | None = None
 
@@ -81,6 +82,7 @@ class ClusterLease(BaseModel):
     node_id: str
     models: list[str] = Field(default_factory=list)
     capacity: int = 1
+    capacities: dict[str, int] = Field(default_factory=dict)
     metrics: dict[str, Any] = Field(default_factory=dict)
 
 

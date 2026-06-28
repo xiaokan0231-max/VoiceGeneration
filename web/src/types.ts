@@ -77,6 +77,7 @@ export interface RuntimeModel extends ModelInfo {
   python: string
   host: string
   port: number
+  replicas: number
   options: Record<string, unknown>
 }
 

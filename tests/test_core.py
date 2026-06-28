@@ -1,8 +1,9 @@
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
 import pytest
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from gateway import cluster
 from gateway.cache import AudioCache
@@ -143,6 +144,30 @@ def test_cluster_lease_is_atomic_and_respects_capacity():
     assert cluster.lease_jobs("nodeC", ["cosyvoice3"], 5, 120) == []
     ids = {j["id"] for j in first + second}
     assert len(ids) == 3  # 三条互不重复
+
+
+def test_cluster_lease_respects_capacity_of_each_model():
+    for i in range(3):
+        _queued(f"cosy-{i}", "cosyvoice3")
+        _queued(f"f5-{i}", "f5_tts")
+
+    jobs = cluster.lease_jobs_by_model(
+        "nodeA", {"cosyvoice3": 1, "f5_tts": 2}, 120,
+    )
+
+    assert Counter(job["model"] for job in jobs) == {
+        "cosyvoice3": 1,
+        "f5_tts": 2,
+    }
+    with db_session() as db:
+        remaining = Counter(
+            db.scalars(
+                select(GenerationHistory.model_id).where(
+                    GenerationHistory.status == "queued"
+                )
+            )
+        )
+    assert remaining == {"cosyvoice3": 2, "f5_tts": 1}
 
 
 def test_cluster_requeue_expired_and_fail():

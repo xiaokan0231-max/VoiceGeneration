@@ -116,6 +116,51 @@ def lease_jobs(node_id: str, models: list[str], capacity: int,
         return leased
 
 
+def lease_jobs_by_model(node_id: str, capacities: dict[str, int],
+                        lease_ttl: int) -> list[dict[str, Any]]:
+    """Atomically lease jobs without borrowing capacity across model pools.
+
+    ``{"cosyvoice3": 2, "f5_tts": 1}`` can lease at most two CosyVoice jobs
+    and one F5 job.  This prevents unrelated idle workers from making a node
+    over-lease one busy model and hold jobs that it cannot execute yet.
+    """
+    clean = {
+        str(model_id): max(0, min(int(capacity), 64))
+        for model_id, capacity in capacities.items()
+        if model_id and int(capacity) > 0
+    }
+    if not clean:
+        return []
+    now = _utcnow()
+    leased: list[dict[str, Any]] = []
+    with db_session() as db:
+        # Stable model order avoids lock-order inversions when several nodes poll.
+        for model_id in sorted(clean):
+            rows = list(
+                db.scalars(
+                    select(GenerationHistory)
+                    .where(
+                        GenerationHistory.status == "queued",
+                        GenerationHistory.model_id == model_id,
+                    )
+                    .order_by(
+                        GenerationHistory.priority.desc(),
+                        GenerationHistory.created_at.asc(),
+                    )
+                    .limit(clean[model_id])
+                    .with_for_update(skip_locked=True)
+                )
+            )
+            for row in rows:
+                row.status = "leased"
+                row.assigned_node = node_id
+                row.lease_expires_at = now + timedelta(seconds=lease_ttl)
+                row.attempts = (row.attempts or 0) + 1
+                leased.append(job_spec(row))
+        db.commit()
+    return leased
+
+
 def extend_lease(job_id: str, lease_ttl: int) -> bool:
     with db_session() as db:
         row = db.get(GenerationHistory, job_id)

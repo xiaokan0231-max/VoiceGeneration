@@ -73,6 +73,14 @@ class Supervisor:
     def total_slots(self) -> int:
         return sum(len(pool) for pool in self.pools.values())
 
+    def slots_by_model(self) -> dict[str, int]:
+        """Configured concurrency per model.
+
+        Cluster scheduling must not treat an idle system/F5 slot as capacity for
+        a CosyVoice job.  A worker process can only serve its configured model.
+        """
+        return {model_id: len(pool) for model_id, pool in self.pools.items()}
+
     def available_capacity(self) -> int:
         return sum(q.qsize() for q in self.free.values())
 

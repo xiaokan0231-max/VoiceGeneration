@@ -237,6 +237,7 @@ def _public_model(model, state: App) -> dict:
         "python": model.python,
         "host": model.host,
         "port": model.port,
+        "replicas": model.replicas,
         "languages": model.languages,
         "supports_cloning": model.supports_cloning,
         "options": model.options,
@@ -633,9 +634,17 @@ async def model_config_update(
     python_path = values.get("python")
     if python_path and not Path(python_path).is_file():
         raise HTTPException(400, "Python 路径不存在")
-    port = values.get("port")
-    if port and any(item.get("id") != model_id and item.get("port") == port for item in raw.get("models", [])):
-        raise HTTPException(400, "端口已被其他模型使用")
+    port = int(values.get("port", model.get("port", 0)))
+    replicas = int(values.get("replicas", model.get("replicas", 1)) or 1)
+    if port + replicas - 1 > 65535:
+        raise HTTPException(400, "端口范围超出 65535")
+    for item in raw.get("models", []):
+        if item.get("id") == model_id:
+            continue
+        other_port = int(item.get("port", 0))
+        other_replicas = int(item.get("replicas", 1) or 1)
+        if max(port, other_port) < min(port + replicas, other_port + other_replicas):
+            raise HTTPException(400, f"端口范围与模型 {item.get('id')} 冲突")
     if options is not None:
         device = options.get("device", model.get("options", {}).get("device"))
         if device not in {None, "auto", "mps", "cpu"}:
@@ -746,13 +755,26 @@ async def cluster_lease(body: ClusterLease, request: Request,
     ]
     await asyncio.to_thread(cluster.touch_node, body.node_id)
     cluster.update_node_runtime(body.node_id, body.metrics)
-    if body.capacity <= 0:
+    capacities: dict[str, int] = {}
+    remaining = max(0, min(int(body.capacity), 64))
+    if body.capacities:
+        for model_id in allowed:
+            requested = max(0, min(int(body.capacities.get(model_id, 0)), 64))
+            capacities[model_id] = min(requested, remaining)
+            remaining -= capacities[model_id]
+    if body.capacity <= 0 or (body.capacities and not any(capacities.values())):
         return {"jobs": []}
     deadline = time.monotonic() + 25  # 长轮询
     while True:
-        jobs = await asyncio.to_thread(
-            cluster.lease_jobs, body.node_id, allowed, body.capacity, c.lease_ttl
-        )
+        if body.capacities:
+            jobs = await asyncio.to_thread(
+                cluster.lease_jobs_by_model, body.node_id, capacities, c.lease_ttl
+            )
+        else:
+            # Backward compatibility for older single-model agents.
+            jobs = await asyncio.to_thread(
+                cluster.lease_jobs, body.node_id, allowed, body.capacity, c.lease_ttl
+            )
         if jobs or time.monotonic() > deadline:
             break
         await asyncio.sleep(0.5)

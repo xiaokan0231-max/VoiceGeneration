@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway.agent import RemoteAgent, connection_state
+from gateway.agent import EmbeddedAgent, RemoteAgent, connection_state
 
 
 @pytest.mark.parametrize(
@@ -63,7 +63,11 @@ def test_full_agent_still_polls_lease_to_keep_node_online():
     async def scenario():
         agent = _agent_for_cluster_test()
         agent.active = {"active-job": {}}
-        agent.supervisor = SimpleNamespace(total_slots=lambda: 1, runtime_metrics=lambda: {"workers": []})
+        agent.supervisor = SimpleNamespace(
+            total_slots=lambda: 1,
+            slots_by_model=lambda: {"cosyvoice3": 1},
+            runtime_metrics=lambda: {"workers": []},
+        )
         calls = []
 
         class FakeResponse:
@@ -88,7 +92,67 @@ def test_full_agent_still_polls_lease_to_keep_node_online():
     assert len(calls) == 1
     assert calls[0][0].endswith("/v1/cluster/lease")
     assert calls[0][1]["json"]["capacity"] == 0
+    assert calls[0][1]["json"]["capacities"] == {"cosyvoice3": 0}
     assert "metrics" in calls[0][1]["json"]
+
+
+def test_agent_reports_free_capacity_per_model():
+    async def scenario():
+        agent = _agent_for_cluster_test()
+        agent._models = lambda: ["cosyvoice3", "f5_tts"]
+        agent.active = {"active-job": {"model": "cosyvoice3"}}
+        agent.supervisor = SimpleNamespace(
+            total_slots=lambda: 3,
+            slots_by_model=lambda: {"cosyvoice3": 2, "f5_tts": 1},
+            runtime_metrics=lambda: {"workers": []},
+        )
+        calls = []
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"jobs": []}
+
+        class FakeClient:
+            async def post(self, url, **kwargs):
+                calls.append((url, kwargs))
+                agent.reconnect.set()
+                return FakeResponse()
+
+        agent._client = FakeClient()
+        await agent._lease_loop(agent.base)
+        return calls[0][1]["json"]
+
+    payload = asyncio.run(scenario())
+    assert payload["capacity"] == 2
+    assert payload["capacities"] == {"cosyvoice3": 1, "f5_tts": 1}
+
+
+def test_embedded_agent_renews_slow_local_job(monkeypatch):
+    calls = []
+
+    async def immediate_sleep(_seconds):
+        return None
+
+    def extend(job_id, lease_ttl):
+        calls.append((job_id, lease_ttl))
+        return False
+
+    agent = EmbeddedAgent.__new__(EmbeddedAgent)
+    agent.state = SimpleNamespace(
+        config=SimpleNamespace(
+            settings=SimpleNamespace(cluster=SimpleNamespace(lease_ttl=120))
+        )
+    )
+    agent._stop = False
+    monkeypatch.setattr("gateway.agent.asyncio.sleep", immediate_sleep)
+    monkeypatch.setattr("gateway.cluster.extend_lease", extend)
+
+    asyncio.run(agent._job_heartbeat("local-job"))
+
+    assert calls == [("local-job", 120)]
 
 
 def test_active_job_renews_its_lease(monkeypatch):
