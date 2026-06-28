@@ -1,0 +1,5 @@
+# F5-TTS worker 依赖
+fastapi>=0.110
+uvicorn[standard]>=0.29
+numpy
+f5-tts            # 官方包，会带入 torch / torchaudio 等

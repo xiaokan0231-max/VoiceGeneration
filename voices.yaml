@@ -1,0 +1,33 @@
+voices:
+- id: narrator_zh
+  name: 中文旁白
+  language: zh
+  ref_audio: voices/narrator_zh/ref.wav
+  ref_text: 这是一段用于声音克隆测试的参考音频，语气清晰自然。
+  models:
+  - cosyvoice3
+  - f5_tts
+- id: narrator_ja
+  name: 日本語ナレーション
+  language: ja
+  ref_audio: voices/narrator_ja/ref.wav
+  ref_text: これは音声クローンのテスト用の参考音声です。はっきりと自然に話します。
+  models:
+  - cosyvoice3
+  - f5_tts
+- id: voice_6eb0172e
+  name: 我自己
+  language: zh
+  ref_audio: voices/voice_6eb0172e/ref.wav
+  ref_text: 大家好，这是我的声音，今天很高兴认识大家。我来自中国，是一名高中生。
+  models:
+  - cosyvoice3
+  - f5_tts
+- id: voice_772da105
+  name: 曼波
+  language: zh
+  ref_audio: voices/voice_772da105/ref.wav
+  ref_text: 曼波，曼波！哦吗次里 曼波，哇晒曼波。哦吗次里，曼波。咋布咋布，油啦油啦，哦吗次里，曼波
+  models:
+  - cosyvoice3
+  - f5_tts

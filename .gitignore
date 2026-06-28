@@ -1,0 +1,36 @@
+# 生成物 / 大文件
+cache/
+!cache/.gitkeep
+models/
+third_party/
+pregen/
+*.wav
+*.mp3
+*.aiff
+*.opus
+*.ogg
+!voices/**/ref.wav
+
+# 前端依赖与构建产物（setup_gateway.sh 会重新 npm build）
+web/node_modules/
+web/dist/
+
+# macOS 双击应用（含本机绝对路径，build_macos_app.sh 会重建）
+VoiceGeneration.app/
+
+# 机器相关配置：各机器从 models.example.yaml 复制成 models.yaml 自行修改
+# （避免多机 git pull 时反复冲突）
+models.yaml
+models.yaml.bak
+voices.yaml.bak
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# 本地 / 工具
+.env
+.DS_Store
+.claude/

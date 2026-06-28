@@ -1,0 +1,6 @@
+# worker 通用“胶水”依赖（在 CosyVoice 自带 requirements 之外额外需要的）
+fastapi>=0.110
+uvicorn[standard]>=0.29
+numpy
+# torch / torchaudio / 以及 CosyVoice 全部依赖，由 scripts/setup_worker.sh
+# 从克隆下来的官方仓库 third_party/CosyVoice/requirements.txt 安装。

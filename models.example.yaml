@@ -1,0 +1,62 @@
+# 模型注册表 + 全局/集群配置的【模板】。
+# 每台机器：cp models.example.yaml models.yaml，再按本机情况修改（models.yaml 不入 git）。
+#   - 协调端(Mac)：cluster.role=coordinator，coordinator_url 留空。
+#   - 工作节点(Windows/其它)：cluster.role=agent、coordinator_url 指向协调端、node_id 唯一、token 与协调端一致；
+#     各模型 python 改成本机 conda 环境的解释器，device 改 cuda，system 设 enabled:false。
+settings:
+  host: 127.0.0.1            # 要让其它机器连协调端，改成 0.0.0.0
+  port: 8080
+  api_token: ''
+  cache_dir: cache
+  cache_max_gb: 30.0
+  worker_idle_timeout: 3600
+  worker_start_timeout: 180
+  default_model: cosyvoice3
+  default_format: wav
+  voices_file: voices.yaml
+  cluster:
+    role: coordinator          # coordinator(含本地 agent) | agent
+    node_id: CHANGE-ME         # 每台必须唯一，如 mac-main / win-4060-a
+    node_name: 我的节点
+    coordinator_url: ''        # agent 必填，如 http://mac-main:8080；coordinator 留空
+    token: ''                  # 多机时两端填同一串随机密钥
+    max_concurrency: 1
+    lease_ttl: 120
+    node_timeout: 60
+    coordinator_runs_jobs: true  # 协调端是否也跑推理(false=只协调)
+models:
+- id: system                   # macOS 'say'；非 macOS 节点请设 enabled:false
+  enabled: true
+  description: macOS 'say' 引擎（仅供本地联调/测试，不支持声音克隆）
+  python: ''
+  backend: workers.system.backend:SystemBackend
+  host: 127.0.0.1
+  port: 8101
+  languages: [zh, ja, en]
+  supports_cloning: false
+- id: cosyvoice3
+  enabled: true
+  description: Fun-CosyVoice3-0.5B-2512 零样本多语种声音克隆 TTS
+  python: ''                   # 改成本机：/Users/.../envs/vg-cosyvoice/bin/python 或 Windows 的 python.exe
+  backend: workers.cosyvoice3.backend:CosyVoice3Backend
+  host: 127.0.0.1
+  port: 8102
+  languages: [zh, en, ja, ko, de, es, fr, it, ru, yue]
+  supports_cloning: true
+  options:
+    repo_dir: third_party/CosyVoice
+    model_dir: models/Fun-CosyVoice3-0.5B-2512
+    device: auto               # Mac: auto/mps；Windows: cuda
+    # placement: { allow: [] } # 可选：限定只在某些 node_id 上跑
+- id: f5_tts
+  enabled: true
+  description: F5-TTS — Flow-matching 零样本声音克隆（中/英；权重首次自动下载）
+  python: ''                   # 改成本机 vg-f5 的解释器
+  backend: workers.f5_tts.backend:F5TTSBackend
+  host: 127.0.0.1
+  port: 8103
+  languages: [zh, en, ja]
+  supports_cloning: true
+  options:
+    model: F5TTS_v1_Base
+    device: auto               # Windows: cuda
