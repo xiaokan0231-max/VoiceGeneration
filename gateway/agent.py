@@ -167,7 +167,8 @@ class RemoteAgent:
                         json={"node_id": self.cluster.node_id, "models": self._models(), "capacity": capacity},
                         timeout=40,
                     )
-                    jobs = r.json().get("jobs", []) if r.status_code == 200 else []
+                    r.raise_for_status()
+                    jobs = r.json().get("jobs", [])
                     self.status.update(connected=True, last_error=None)
                 except httpx.HTTPError as exc:
                     self.status.update(connected=False, last_error=str(exc))
@@ -190,10 +191,11 @@ class RemoteAgent:
 
     async def _register(self) -> None:
         c = self.cluster
-        await self._client.post(f"{self.base}/v1/cluster/register", headers=self.headers, json={
+        r = await self._client.post(f"{self.base}/v1/cluster/register", headers=self.headers, json={
             "node_id": c.node_id, "name": c.node_name, "role": "agent",
             "models": self._models(), "max_concurrency": self.supervisor.total_slots(), "version": "1.0.0",
         })
+        r.raise_for_status()  # 非 2xx（含被代理拦截/令牌错误）视为未连接
 
     async def _fetch_asset(self, voice: str) -> str:
         if voice in self._asset_cache and Path(self._asset_cache[voice]).exists():
