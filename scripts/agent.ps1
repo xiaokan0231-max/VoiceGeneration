@@ -1,16 +1,41 @@
-# 以「工作节点」身份加入集群（Windows）。在仓库根目录运行：
-#   conda activate vg-gateway ; ./scripts/agent.ps1
-#
-# 首次：Copy-Item models.example.yaml models.yaml，按本机改 python 路径 / device:cuda / system 设 enabled:false。
-# 启动后浏览器打开 http://127.0.0.1:8090 —— 在网页里填主节点地址/令牌、设模型副本（保存即热生效）。
-# 主节点地址/令牌可在【主机】的「服务设置 → 副节点接入信息」里直接复制。
+# Start a Windows cluster worker from the repository root.
+# The local control panel is available at http://127.0.0.1:8090.
+# Coordinator settings and model replicas can be changed from that page.
+param(
+    [string]$CoordinatorUrl = $env:VG_COORDINATOR_URL,
+    [string]$ClusterToken = $env:VG_CLUSTER_TOKEN,
+    [string]$NodeId = $env:VG_NODE_ID,
+    [string]$NodeName = $env:VG_NODE_NAME
+)
+
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot -Parent)
 
-# 可选：首次用环境变量引导（之后建议改用网页配置；网页保存会写入 models.yaml）
-# $env:VG_COORDINATOR_URL = "http://mac-main:8080"
-# $env:VG_CLUSTER_TOKEN   = ""
 $env:VG_CLUSTER_ROLE = "agent"
+if ($CoordinatorUrl) { $env:VG_COORDINATOR_URL = $CoordinatorUrl }
+if ($ClusterToken) { $env:VG_CLUSTER_TOKEN = $ClusterToken }
+if ($NodeId) { $env:VG_NODE_ID = $NodeId }
+if ($NodeName) { $env:VG_NODE_NAME = $NodeName }
 
-Write-Host ">> 启动副节点 agent；控制台 http://127.0.0.1:8090"
-conda run --no-capture-output -n vg-gateway python -m gateway.agent
+$python = $env:VG_GATEWAY_PYTHON
+if (-not $python) {
+    $condaCandidates = @(
+        $env:CONDA_EXE,
+        "$env:USERPROFILE\miniconda3\Scripts\conda.exe",
+        "$env:USERPROFILE\anaconda3\Scripts\conda.exe",
+        "D:\Users\$env:USERNAME\miniconda3\Scripts\conda.exe",
+        "C:\ProgramData\miniconda3\Scripts\conda.exe"
+    ) | Where-Object { $_ -and (Test-Path $_) }
+    $conda = $condaCandidates | Select-Object -First 1
+    if (-not $conda) {
+        $condaCommand = Get-Command conda -ErrorAction SilentlyContinue
+        if ($condaCommand) { $conda = $condaCommand.Source }
+    }
+    if (-not $conda) { throw "Conda was not found. Set VG_GATEWAY_PYTHON to the gateway Python executable." }
+    $condaBase = (& $conda info --base).Trim()
+    $python = Join-Path $condaBase "python.exe"
+}
+if (-not (Test-Path $python)) { throw "Gateway Python does not exist: $python" }
+
+Write-Host ">> Starting agent; control panel: http://127.0.0.1:8090"
+& $python -m gateway.agent

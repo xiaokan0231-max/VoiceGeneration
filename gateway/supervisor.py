@@ -177,15 +177,21 @@ class Supervisor:
     def _stop(self, st: WorkerState) -> None:
         if st.process and st.process.poll() is None:
             try:
-                os.killpg(os.getpgid(st.process.pid), signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
+                if os.name == "nt":
+                    st.process.terminate()
+                else:
+                    os.killpg(os.getpgid(st.process.pid), signal.SIGTERM)
+            except (AttributeError, ProcessLookupError, PermissionError):
                 st.process.terminate()
         st.process = None
 
     async def _wait_healthy(self, st: WorkerState) -> None:
         url = f"{st.base_url}/health"
         deadline = time.time() + self.settings.worker_start_timeout
-        async with httpx.AsyncClient(timeout=5) as client:
+        # Worker endpoints are always local. Ignore HTTP_PROXY/HTTPS_PROXY so
+        # VPN/TUN adapters (Clash, V2Ray, FastLink, etc.) cannot intercept
+        # 127.0.0.1 health checks and cause a false startup timeout.
+        async with httpx.AsyncClient(timeout=5, trust_env=False) as client:
             while time.time() < deadline:
                 if not st.running:
                     raise RuntimeError(

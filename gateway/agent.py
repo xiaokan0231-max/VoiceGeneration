@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import time
+from collections import deque
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -18,6 +20,20 @@ from fastapi.responses import FileResponse, HTMLResponse
 
 from .config import ROOT, load_config, load_raw_models, save_raw_models
 from .supervisor import Supervisor
+
+
+def connection_state(*, enabled: bool, coordinator_url: str, connected: bool,
+                     last_error: str | None) -> str:
+    """Return the UI-facing connection state without conflating idle states."""
+    if not enabled:
+        return "disconnected"
+    if not coordinator_url:
+        return "unconfigured"
+    if connected:
+        return "connected"
+    if last_error:
+        return "error"
+    return "connecting"
 
 
 async def run_worker(supervisor: Supervisor, model_cfg, payload: dict, timeout: float = 1800) -> bytes:
@@ -110,6 +126,8 @@ class RemoteAgent:
         self.enabled = self.config.settings.cluster.enabled  # 是否主动连接(网页连接/断开控制)
         self.reconnect = asyncio.Event()
         self.status = {"connected": False, "last_error": None, "counters": {"leased": 0, "completed": 0, "failed": 0}}
+        self._logs: deque[dict] = deque(maxlen=300)
+        self._last_log: tuple[str, str] | None = None
         self._stop = False
         # trust_env=False：忽略 HTTP_PROXY/HTTPS_PROXY 等环境变量，直连协调端，
         # 避免被本机系统代理/VPN(Clash/V2Ray)截走导致 502。
@@ -117,6 +135,27 @@ class RemoteAgent:
         self._asset_dir = Path(tempfile.gettempdir()) / "vg-agent-assets"
         self._asset_dir.mkdir(parents=True, exist_ok=True)
         self._asset_cache: dict[str, str] = {}
+        self._log("info", f"副节点已启动：{self.cluster.node_id}，可用模型：{', '.join(self._models()) or '无'}")
+
+    def _log(self, level: str, message: str, *, dedupe: bool = False) -> None:
+        key = (level, message)
+        if dedupe and self._last_log == key:
+            return
+        self._logs.append({
+            "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "level": level,
+            "message": message,
+        })
+        self._last_log = key
+
+    @staticmethod
+    def _http_error(exc: Exception) -> str:
+        if isinstance(exc, httpx.HTTPStatusError):
+            response = exc.response
+            detail = response.text.strip().replace("\n", " ")[:300]
+            suffix = f"：{detail}" if detail else ""
+            return f"HTTP {response.status_code} {response.request.url}{suffix}"
+        return str(exc)
 
     # ---- 便捷属性 -------------------------------------------------------
     @property
@@ -142,16 +181,28 @@ class RemoteAgent:
         while not self._stop:
             self.reconnect.clear()
             c = self.cluster
-            if not self.enabled or not c.coordinator_url:
-                self.status["connected"] = False
+            if not self.enabled:
+                self.status.update(connected=False, last_error=None)
+                self._log("info", "已暂停连接协调端", dedupe=True)
+                await self._sleep_or_wake(3600)
+                continue
+            if not c.coordinator_url:
+                message = "未配置主节点地址"
+                self.status.update(connected=False, last_error=message)
+                self._log("warning", message, dedupe=True)
                 await self._sleep_or_wake(3600)  # 断开态：挂起等待「连接」唤醒
                 continue
             try:
                 await self._register()
+                was_connected = self.status["connected"]
                 self.status.update(connected=True, last_error=None)
+                if not was_connected:
+                    self._log("info", f"已连接协调端：{c.coordinator_url}")
                 backoff = 1.0
             except Exception as exc:  # noqa: BLE001
-                self.status.update(connected=False, last_error=str(exc))
+                message = self._http_error(exc)
+                self.status.update(connected=False, last_error=message)
+                self._log("error", f"连接协调端失败：{message}", dedupe=True)
                 await self._sleep_or_wake(backoff)
                 backoff = min(backoff * 2, 30)
                 continue
@@ -162,25 +213,30 @@ class RemoteAgent:
                and self.enabled and self.cluster.coordinator_url == url):
             capacity = max(0, self.supervisor.total_slots() - len(self.active))
             jobs: list[dict] = []
-            if capacity > 0:
-                try:
-                    r = await self._client.post(
-                        f"{self.base}/v1/cluster/lease", headers=self.headers,
-                        json={"node_id": self.cluster.node_id, "models": self._models(), "capacity": capacity},
-                        timeout=40,
-                    )
-                    r.raise_for_status()
-                    jobs = r.json().get("jobs", [])
-                    self.status.update(connected=True, last_error=None)
-                except httpx.HTTPError as exc:
-                    self.status.update(connected=False, last_error=str(exc))
-                    return
+            # capacity=0 也必须继续长轮询：协调端会在 lease 入口更新
+            # node.last_seen。否则节点满载执行长任务时会被 node_timeout
+            # 错误标记为离线。
+            try:
+                r = await self._client.post(
+                    f"{self.base}/v1/cluster/lease", headers=self.headers,
+                    json={"node_id": self.cluster.node_id, "models": self._models(), "capacity": capacity},
+                    timeout=40,
+                )
+                r.raise_for_status()
+                jobs = r.json().get("jobs", [])
+                self.status.update(connected=True, last_error=None)
+            except httpx.HTTPError as exc:
+                message = self._http_error(exc)
+                self.status.update(connected=False, last_error=message)
+                self._log("error", f"认领任务失败：{message}", dedupe=True)
+                return
             for job in jobs:
                 self.status["counters"]["leased"] += 1
                 # 同步登记，避免下一轮 lease 在任务populate active 前重复计算容量→超额认领
                 self.active[job["id"]] = {"model": job["model"],
                                           "text": (job.get("text") or "")[:60],
                                           "started": time.monotonic()}
+                self._log("info", f"认领任务 {job['id']}（{job['model']}）")
                 asyncio.create_task(self._run_job(job))
             if not jobs:
                 await self._sleep_or_wake(self.cluster.poll_interval)
@@ -212,6 +268,7 @@ class RemoteAgent:
     async def _run_job(self, job: dict) -> None:
         jid = job["id"]  # 已在 _lease_loop 登记进 self.active
         started = time.perf_counter()
+        heartbeat = asyncio.create_task(self._job_heartbeat(jid))
         try:
             model = self.config.model(job["model"])
             if not model or not model.enabled:
@@ -224,14 +281,17 @@ class RemoteAgent:
                 "ref_audio_path": ref_audio_path, "ref_text": job.get("ref_text"),
             }
             wav = await run_worker(self.supervisor, model, payload)
-            await self._client.post(
+            result = await self._client.post(
                 f"{self.base}/v1/cluster/jobs/{jid}/result", headers=self.headers,
                 files={"audio": ("out.wav", wav, "audio/wav")},
                 data={"node_id": self.cluster.node_id, "elapsed": str(time.perf_counter() - started)},
             )
+            result.raise_for_status()
             self.status["counters"]["completed"] += 1
+            self._log("info", f"任务 {jid} 完成，耗时 {time.perf_counter() - started:.1f}s")
         except Exception as exc:  # noqa: BLE001
             self.status["counters"]["failed"] += 1
+            self._log("error", f"任务 {jid} 失败：{exc}")
             try:
                 await self._client.post(f"{self.base}/v1/cluster/jobs/{jid}/fail",
                                         headers=self.headers,
@@ -239,7 +299,32 @@ class RemoteAgent:
             except httpx.HTTPError:
                 pass
         finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
             self.active.pop(jid, None)
+
+    async def _job_heartbeat(self, job_id: str) -> None:
+        """Extend an active job lease until synthesis/result upload finishes."""
+        interval = max(5.0, min(30.0, self.cluster.lease_ttl / 3))
+        while not self._stop and job_id in self.active:
+            await asyncio.sleep(interval)
+            if self._stop or job_id not in self.active:
+                return
+            try:
+                response = await self._client.post(
+                    f"{self.base}/v1/cluster/jobs/{job_id}/heartbeat",
+                    headers=self.headers,
+                    timeout=10,
+                )
+                response.raise_for_status()
+                if not response.json().get("ok"):
+                    raise RuntimeError("协调端未找到有效租约")
+            except Exception as exc:  # noqa: BLE001
+                self._log(
+                    "warning",
+                    f"任务 {job_id} 续租失败：{self._http_error(exc)}",
+                    dedupe=True,
+                )
 
     async def stop(self) -> None:
         self._stop = True
@@ -254,6 +339,10 @@ class RemoteAgent:
             "node_id": c.node_id, "node_name": c.node_name, "role": "agent",
             "coordinator_url": c.coordinator_url, "token_set": bool(c.token),
             "connected": self.status["connected"], "last_error": self.status["last_error"],
+            "connection_state": connection_state(
+                enabled=self.enabled, coordinator_url=c.coordinator_url,
+                connected=self.status["connected"], last_error=self.status["last_error"],
+            ),
             "enabled": self.enabled, "total_slots": sup.total_slots(),
             "available": sup.available_capacity(), "inflight": len(self.active),
             "counters": self.status["counters"],
@@ -268,6 +357,9 @@ class RemoteAgent:
         now = time.monotonic()
         return [{"id": jid, "model": j["model"], "text": j["text"], "elapsed": round(now - j["started"], 1)}
                 for jid, j in list(self.active.items())]
+
+    def logs(self) -> list[dict]:
+        return list(self._logs)
 
     def config_view(self) -> dict:
         c = self.cluster
@@ -298,6 +390,7 @@ class RemoteAgent:
         raw.setdefault("settings", {}).setdefault("cluster", {})["enabled"] = value
         save_raw_models(raw)
         self.config.settings.cluster.enabled = value
+        self._log("info", "已启用连接协调端" if value else "已断开协调端")
         self.reconnect.set()
 
     async def apply_config(self, updates: dict) -> None:
@@ -324,6 +417,11 @@ class RemoteAgent:
             if key in updates and updates[key] is not None:
                 setattr(self.config.settings.cluster, key, updates[key])
         await self.supervisor.reconfigure(self.config.enabled_models())
+        enabled_models = ", ".join(
+            f"{m.id}×{m.replicas}" for m in self.config.enabled_models()
+        ) or "无"
+        target = self.config.settings.cluster.coordinator_url or "未配置"
+        self._log("info", f"配置已应用：协调端={target}，模型={enabled_models}")
         self.reconnect.set()
 
 
@@ -353,6 +451,10 @@ def build_agent_app() -> FastAPI:
     @app.get("/api/jobs")
     async def api_jobs():
         return agent.jobs()
+
+    @app.get("/api/logs")
+    async def api_logs():
+        return agent.logs()
 
     @app.get("/api/config")
     async def api_config():
