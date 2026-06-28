@@ -11,7 +11,8 @@
   header { display:flex; align-items:center; gap:12px; padding:16px 22px; border-bottom:1px solid var(--line); }
   header h1 { font-size:16px; margin:0; font-weight:600; } header .sub { color:var(--muted); font-size:12px; }
   .dot { width:9px; height:9px; border-radius:50%; background:var(--muted); display:inline-block; }
-  .dot.on { background:var(--green); } .dot.off { background:var(--danger); }
+  .dot.on { background:var(--green); } .dot.off { background:var(--danger); } .dot.warn { background:#d9a852; }
+  button.danger { background:#7a2f2a; color:#f0d6d2; }
   main { max-width:880px; margin:0 auto; padding:22px; display:flex; flex-direction:column; gap:18px; }
   section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:18px; }
   h2 { font-size:13px; margin:0 0 14px; color:#acb3b6; letter-spacing:.04em; text-transform:uppercase; }
@@ -39,6 +40,7 @@
 <header>
   <span id="conn" class="dot"></span>
   <div><h1 id="nodeName">副节点控制台</h1><div class="sub" id="nodeSub">—</div></div>
+  <button class="ghost" style="margin-left:auto" onclick="refreshAll()">⟳ 刷新</button>
 </header>
 <main>
   <section>
@@ -68,7 +70,7 @@
       <div><b id="cDone">—</b>已完成</div>
       <div><b id="cFail">—</b>失败</div>
     </div>
-    <div class="toolbar"><button class="ghost" id="pauseBtn" onclick="togglePause()">暂停认领</button><span id="stateText" class="muted"></span></div>
+    <div class="toolbar"><button id="connBtn" onclick="toggleConn()">连接</button><span id="stateText" class="muted"></span></div>
     <div class="err" id="lastErr"></div>
   </section>
 
@@ -89,7 +91,7 @@
 
 <script>
 let MODELS = [];     // 配置表里的模型（可编辑）
-let PAUSED = false;
+let ENABLED = false;
 const $ = id => document.getElementById(id);
 const esc = s => (s||'').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 function toast(t){ const e=$('toast'); e.textContent=t; e.classList.add('show'); setTimeout(()=>e.classList.remove('show'),1500); }
@@ -125,24 +127,27 @@ async function save(){
   if(r.ok){ $('token').value=''; toast('已保存并应用'); await loadConfig(); } else { toast('保存失败'); }
 }
 
-async function togglePause(){
-  const r = await fetch('/api/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paused:!PAUSED})});
-  if(r.ok){ const d=await r.json(); PAUSED=d.paused; toast(PAUSED?'已暂停认领':'已恢复认领'); }
+async function toggleConn(){
+  const r = await fetch(ENABLED ? '/api/disconnect' : '/api/connect', {method:'POST'});
+  if(r.ok){ const d=await r.json(); ENABLED=d.enabled; toast(ENABLED?'已连接':'已断开'); refresh(); }
 }
 
 async function refresh(){
   try {
     const s = await (await fetch('/api/status')).json();
-    PAUSED = s.paused;
-    $('conn').className = 'dot ' + (s.connected?'on':'off');
+    ENABLED = s.enabled;
+    $('conn').className = 'dot ' + (s.connected ? 'on' : (s.enabled ? 'warn' : 'off'));
     $('nodeName').textContent = s.node_name || s.node_id || '副节点';
-    $('nodeSub').textContent = `${s.node_id} · ${s.connected?'已连接协调端':'未连接'} · ${s.coordinator_url||'未配置主节点'}`;
+    const state = !s.enabled ? '已断开' : (s.connected ? '已连接协调端' : '连接中…');
+    $('nodeSub').textContent = `${s.node_id} · ${state} · ${s.coordinator_url||'未配置主节点'}`;
     $('capacity').textContent = `${s.available}/${s.total_slots}`;
     $('inflight').textContent = s.inflight;
     $('cDone').textContent = s.counters.completed;
     $('cFail').textContent = s.counters.failed;
-    $('pauseBtn').textContent = PAUSED?'恢复认领':'暂停认领';
-    $('stateText').textContent = PAUSED?'已暂停（不认领新任务）':'';
+    const btn = $('connBtn');
+    btn.textContent = s.enabled ? '断开' : '连接';
+    btn.className = s.enabled ? 'danger' : '';
+    $('stateText').textContent = !s.enabled ? '已断开（不连接协调端）' : (s.connected ? '已连接' : '连接中…');
     $('lastErr').textContent = s.last_error ? ('最近错误：'+s.last_error) : '';
     (s.models||[]).forEach(m=>{ const el=$('loaded-'+m.id); if(el){ el.textContent=m.loaded?'是':'否'; el.className=m.loaded?'ok':'muted'; }});
   } catch(e){ $('conn').className='dot off'; }
@@ -161,6 +166,8 @@ async function refresh(){
     $('nodes').innerHTML = nodes.map(n=>`<tr><td>${esc(n.name)}</td><td>${esc(n.role)}</td><td>${esc((n.models||[]).join('/'))}</td><td>${n.max_concurrency}</td><td class="${n.status==='online'?'ok':'muted'}">${n.status==='online'?'在线':'离线'}</td></tr>`).join('');
   } catch(e){}
 }
+
+function refreshAll(){ loadConfig(); refresh(); toast('已刷新'); }
 
 loadConfig();
 refresh();

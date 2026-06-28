@@ -26,6 +26,7 @@ settings:
     coordinator_runs_jobs: true  # 协调端是否也跑推理(false=只协调)
     agent_host: 127.0.0.1        # 副节点 web 控制台监听地址
     agent_port: 8090             # 副节点 web 控制台端口（浏览器开 http://127.0.0.1:8090）
+    enabled: false               # 副节点是否主动连接（由控制台「连接/断开」控制，会自动回写这里）
 models:
 # 注意 replicas：单个 worker 进程内部是串行的（GIL + 单 GPU 队列），真正的并行靠
 # 同模型多开几个进程。replicas=N 会占用 port..port+N-1 这 N 个端口（所以各模型端口要留出间隔）。

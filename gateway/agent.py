@@ -107,7 +107,7 @@ class RemoteAgent:
         self.config = load_config()
         self.supervisor = Supervisor(self.config.settings, self.config.enabled_models())
         self.active: dict[str, dict] = {}            # job_id -> {model, text, started}
-        self.paused = False
+        self.enabled = self.config.settings.cluster.enabled  # 是否主动连接(网页连接/断开控制)
         self.reconnect = asyncio.Event()
         self.status = {"connected": False, "last_error": None, "counters": {"leased": 0, "completed": 0, "failed": 0}}
         self._stop = False
@@ -142,9 +142,9 @@ class RemoteAgent:
         while not self._stop:
             self.reconnect.clear()
             c = self.cluster
-            if not c.coordinator_url or self.paused:
+            if not self.enabled or not c.coordinator_url:
                 self.status["connected"] = False
-                await self._sleep_or_wake(1.0)
+                await self._sleep_or_wake(3600)  # 断开态：挂起等待「连接」唤醒
                 continue
             try:
                 await self._register()
@@ -159,7 +159,7 @@ class RemoteAgent:
 
     async def _lease_loop(self, url: str) -> None:
         while (not self._stop and not self.reconnect.is_set()
-               and not self.paused and self.cluster.coordinator_url == url):
+               and self.enabled and self.cluster.coordinator_url == url):
             capacity = max(0, self.supervisor.total_slots() - len(self.active))
             jobs: list[dict] = []
             if capacity > 0:
@@ -254,7 +254,7 @@ class RemoteAgent:
             "node_id": c.node_id, "node_name": c.node_name, "role": "agent",
             "coordinator_url": c.coordinator_url, "token_set": bool(c.token),
             "connected": self.status["connected"], "last_error": self.status["last_error"],
-            "paused": self.paused, "total_slots": sup.total_slots(),
+            "enabled": self.enabled, "total_slots": sup.total_slots(),
             "available": sup.available_capacity(), "inflight": len(self.active),
             "counters": self.status["counters"],
             "models": [
@@ -291,9 +291,14 @@ class RemoteAgent:
         except Exception:  # noqa: BLE001
             return {}
 
-    def set_paused(self, paused: bool) -> None:
-        self.paused = paused
-        self.reconnect.set()  # 唤醒循环立即生效
+    def set_enabled(self, value: bool) -> None:
+        """连接/断开：持久化到 models.yaml 并立即唤醒循环生效。"""
+        self.enabled = value
+        raw = load_raw_models()
+        raw.setdefault("settings", {}).setdefault("cluster", {})["enabled"] = value
+        save_raw_models(raw)
+        self.config.settings.cluster.enabled = value
+        self.reconnect.set()
 
     async def apply_config(self, updates: dict) -> None:
         """把网页改动落盘到 models.yaml 并热生效。"""
@@ -358,10 +363,15 @@ def build_agent_app() -> FastAPI:
         await agent.apply_config(body)
         return {"ok": True}
 
-    @app.post("/api/pause")
-    async def api_pause(body: dict = Body(...)):
-        agent.set_paused(bool(body.get("paused")))
-        return {"ok": True, "paused": agent.paused}
+    @app.post("/api/connect")
+    async def api_connect():
+        agent.set_enabled(True)
+        return {"ok": True, "enabled": True}
+
+    @app.post("/api/disconnect")
+    async def api_disconnect():
+        agent.set_enabled(False)
+        return {"ok": True, "enabled": False}
 
     @app.get("/api/coordinator")
     async def api_coordinator():

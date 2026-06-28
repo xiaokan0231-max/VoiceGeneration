@@ -29,6 +29,7 @@ class ClusterConfig:
     max_attempts: int = 3
     agent_host: str = "127.0.0.1"       # 副节点 web 控制台监听地址
     agent_port: int = 8090              # 副节点 web 控制台端口
+    enabled: bool = False               # 副节点是否主动连接协调端(网页「连接/断开」控制，持久化)
 
     @property
     def is_coordinator(self) -> bool:
