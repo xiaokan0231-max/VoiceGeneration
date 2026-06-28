@@ -66,11 +66,26 @@ def run_migration(conda: str) -> None:
     )
 
 
+def gateway_host(conda: str) -> str:
+    """读取 models.yaml 里的 settings.host（默认 127.0.0.1）。"""
+    try:
+        out = subprocess.run(
+            [conda, "run", "-n", "vg-gateway", "python", "-c",
+             "from gateway.config import load_config; print(load_config().settings.host)"],
+            cwd=ROOT, capture_output=True, text=True, timeout=30,
+        )
+        return out.stdout.strip() or "127.0.0.1"
+    except Exception:
+        return "127.0.0.1"
+
+
 def start_gateway(conda: str) -> None:
     gateway_log = (LOG_DIR / "gateway.log").open("a", encoding="utf-8")
+    host = gateway_host(conda)
+    log(f"网关监听地址 host={host}")
     process = subprocess.Popen(
         [conda, "run", "--no-capture-output", "-n", "vg-gateway", "uvicorn",
-         "gateway.main:app", "--host", "127.0.0.1", "--port", "8080"],
+         "gateway.main:app", "--host", host, "--port", "8080"],
         cwd=ROOT, stdin=subprocess.DEVNULL, stdout=gateway_log, stderr=subprocess.STDOUT,
         start_new_session=True,
     )
