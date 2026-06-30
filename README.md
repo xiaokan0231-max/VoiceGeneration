@@ -1,329 +1,332 @@
-# VoiceGeneration — 本机文字转语音服务 + Web 工作台
+# VoiceGeneration
 
-一个跑在本机（macOS / Apple Silicon）的**文字转语音（TTS）服务**：统一一套 REST API，
-背后挂多个**可插拔的模型**（CosyVoice3、F5-TTS、macOS 系统引擎），支持**零样本声音克隆**、
-按**项目**归类生成、生成历史（MySQL）、以及一个同源托管的 **Web 工作台**。
+A local, pluggable text-to-speech service — one unified REST API in front of multiple TTS models, with voice cloning, projects, generation history, a React web workbench, a multi-machine cluster, and a cross-platform tray app.
 
-> 给 AI 阅读者：这份 README 力求自包含。读完你应能：启动服务、调用 API 合成语音、
-> 用 Web 工作台、新增/删除模型、管理音色与项目。所有路径相对仓库根
-> `/Users/kanxiao/IdeaProjects/VoiceGeneration`。
+**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md)
 
----
+VoiceGeneration runs on your own machine (Apple Silicon primary, optional CUDA worker nodes). It exposes a single REST API that fronts several pluggable TTS engines (CosyVoice3, F5-TTS, macOS `say`), supports zero-shot voice cloning, organizes generations into projects, persists history in MySQL, and ships a same-origin React/TypeScript/Vite workbench served straight from the gateway. It was built first for the 歴史 (history-documentary) use case, then generalized.
 
-## 1. 架构一览
+## Features
 
-```
-浏览器 / API 客户端
-        │  HTTP (默认 127.0.0.1:8080)
-        ▼
-┌─────────────────────────────────────────────┐
-│ gateway  (FastAPI, conda 环境 vg-gateway)     │
-│  · 统一 REST API + 同源托管 Web 工作台(web/dist)│
-│  · 内容寻址磁盘缓存 (cache/)                    │
-│  · 生成历史 → 本机 MySQL (voice_generation)    │
-│  · 音色库 → 文件 (voices.yaml + voices/<id>/)  │
-│  · 项目 → MySQL (projects 表)                  │
-│  · supervisor: 按需拉起/空闲回收 worker 子进程  │
-└───────────────┬───────────────┬───────────────┘
-                │ 本机 HTTP      │
-       ┌────────▼──────┐ ┌──────▼─────────┐  每个模型一个独立 conda 环境+子进程，
-       │ worker:system │ │ worker:cosyvoice│  依赖(torch 版本等)互相隔离；
-       │ (macOS say)   │ │ worker:f5_tts   │  首次调用惰性加载、空闲超时自动卸载。
-       └───────────────┘ └────────────────┘
-```
+- **Cross-platform tray app** — one codebase runs in the macOS menu bar and the Windows system tray. Pick the node role (coordinator / agent) at launch, supervise the backend, and have it auto-restart if it dies.
+- **Multi-machine cluster** — one Mac coordinator plus zero or more worker agents (e.g. a Windows RTX 4060). All audio, history, and voices live centrally on the coordinator; nodes lease jobs and post results back.
+- **Pluggable models** — each model runs as an isolated worker subprocess in its own conda env. Add or remove a model by editing `models.yaml`; the gateway code is never touched.
+- **Zero-shot voice cloning** — clone a voice from a short reference clip; clone voices are file-backed (not in the DB).
+- **Web workbench** — generate, manage clone voices, organize projects, browse history, and tune service settings — all served same-origin by the gateway.
+- **Content-addressed cache + history** — identical requests return instantly from an LRU disk cache; every generation is recorded in MySQL.
+- **Replica pools** — run multiple worker processes per model for real parallelism (a single worker is internally serial).
 
-- **gateway** 是唯一对外入口；模型在**各自的 conda 环境**里以子进程运行
-  （`worker_runtime/server.py` 加载 `workers/<model>/backend.py`）。
-- **可插拔**：增删模型 = 改 `models.yaml` + 写一个 `backend.py`，gateway 不动。
-- **缓存**：相同(文本/模型/音色/模式/语速/格式/参考音频)命中缓存直接返回；
-  响应头 `X-Cache: HIT|MISS`。项目（project_id）**不参与**缓存键，跨项目共享音频。
+## Architecture
 
----
+The **FastAPI gateway** (conda env `vg-gateway`, Python 3.11) is the only external entry point. It serves the REST API, the built web workbench from `web/dist`, the content-addressed audio cache, generation history + projects in MySQL (`voice_generation` DB), and a file-backed voice library.
 
-## 2. 目录结构
+Each model runs as a **separate worker subprocess** in its **own conda env** for dependency isolation (e.g. different torch versions). The supervisor spawns `<python> -m worker_runtime.server` per worker, which loads `workers/<model>/backend.py`. Workers expose `/health`, `/info`, and `/synthesize`, and return 16-bit PCM WAV bytes; the gateway transcodes (via ffmpeg) and stores the result.
 
 ```
-gateway/            网关：main.py(全部路由) config.py cache.py supervisor.py
-                    database.py(MySQL: 历史+项目) voice_store.py(文件音色) audio.py schemas.py
-worker_runtime/     所有 worker 共用：server.py(通用服务) base.py(TTSBackend 接口)
-workers/            模型后端：system/(macOS say) cosyvoice3/ f5_tts/  各含 backend.py
-web/                React+TS+Vite 工作台；构建产物 web/dist 由 gateway 托管
-alembic/            MySQL 迁移（versions/ 下按 YYYYMMDD_NN 命名）
-scripts/            setup_gateway.sh setup_worker.sh download_weights.sh start.sh tts.sh
-                    launcher.py build_macos_app.sh
-voices.yaml         克隆音色清单（参考音频 + 逐字稿）
-voices/<id>/ref.wav 参考音频（16k 单声道）
-models.yaml         模型注册表（“插口”）+ 全局 settings
-cache/              生成音频缓存(内容寻址) + cache/_logs/(网关与 worker 日志)
-models/  third_party/  下载的权重 / 克隆的官方仓库（不入 git）
-examples/           接入「歴史」项目示例：history_audio_router.py / batch_pregenerate.py
-tests/              pytest（test_core.py 需本机 MySQL；test_cosyvoice_modes.py mock）
+client ──► gateway (FastAPI :8080) ──► supervisor ──► worker replica pool ──► backend
+              │  REST API + web/dist                    (own conda env, lazy spawn,
+              │  cache/ (LRU disk)                        idle-unload, ports base..base+N-1)
+              │  MySQL: history + projects
+              │  voices.yaml + voices/<id>/ref.wav
+              └─ cluster queue (MySQL row locks)
+                    ├─ embedded local agent (coordinator)
+                    └─ remote agents (Windows / others, lease + post results)
 ```
 
----
+- **Replica pools** — a single worker process is serial (GIL + single Metal/CUDA queue), so real parallelism comes from running multiple processes for the same model (`replicas=N`, each on its own port `base..base+N-1`). Jobs are dispatched to free replicas via `acquire()/release()`.
+- **Lazy + idle** — workers spawn on first request and are reaped when idle longer than `worker_idle_timeout`. Health checks use `httpx` with `trust_env=False` so VPN/TUN proxies (Clash/V2Ray) cannot intercept `127.0.0.1`.
+- **Cluster** — one coordinator holds the queue; agents lease jobs, run inference, and post results back. The coordinator can also run an embedded local agent (`coordinator_runs_jobs`).
 
-## 3. 环境前提
+See [`gateway/main.py`](gateway/main.py) (all routes), [`gateway/supervisor.py`](gateway/supervisor.py), [`gateway/cluster.py`](gateway/cluster.py), and [`gateway/agent.py`](gateway/agent.py).
 
-- macOS（Apple Silicon），已装 **miniconda**、**Homebrew**、**ffmpeg**(`brew install ffmpeg`)、
-  **MySQL**(`brew install mysql && brew services start mysql`，默认 `root` 无密码)、**Node.js**。
-- conda 环境：`vg-gateway`(py3.11，网关) / `vg-cosyvoice`(py3.10) / `vg-f5`(py3.10)。
+## Quick start
 
----
+### Prerequisites
 
-## 4. 安装与启动
+- macOS on Apple Silicon (M-series), with [conda](https://docs.conda.io) (scripts assume `~/miniconda3`)
+- **MySQL** (Homebrew) — the gateway connects to `mysql+pymysql://root@127.0.0.1:3306/voice_generation`
+- **ffmpeg / ffprobe** (Homebrew) — for audio transcoding and duration probing
+- **Node.js + npm** — to build the web UI
 
 ```bash
-# 一次性安装：建 vg-gateway 环境、装依赖、构建 Web、跑 DB 迁移、生成 macOS .app
+brew install mysql ffmpeg node
+brew services start mysql
+```
+
+### Install
+
+One-shot gateway setup: creates the `vg-gateway` env (Python 3.11), copies `models.example.yaml` → `models.yaml`, installs deps, builds the web UI, runs DB migrations, and builds the macOS tray app.
+
+```bash
 bash scripts/setup_gateway.sh
 ```
 
-启动方式：
+Set up the model workers you want (each gets its own conda env), then download weights as needed:
 
 ```bash
-# A) 命令行启动网关（前台）：会先 alembic upgrade head，再起 uvicorn
-bash scripts/start.sh                       # → http://127.0.0.1:8080
+bash scripts/setup_worker.sh cosyvoice3      # creates env vg-cosyvoice, clones the official repo
+bash scripts/download_weights.sh cosyvoice3  # downloads weights to models/Fun-CosyVoice3-0.5B-2512
+bash scripts/setup_worker.sh f5_tts          # creates env vg-f5 (F5-TTS weights auto-download on first synth)
+```
 
-# B) 托盘程序（推荐）：构建并双击 VoiceGeneration.app → 菜单栏出现图标
-bash scripts/build_macos_app.sh             # 解析 vg-gateway python + 生成图标 + 打包
+After running `setup_worker.sh`, set that model's `enabled: true` in `models.yaml` and restart the gateway.
+
+### Run — recommended: the tray app
+
+Build the macOS `.app`, then launch it and choose the node role from the menu:
+
+```bash
+bash scripts/build_macos_app.sh
 open VoiceGeneration.app
-#    启动时按 models.yaml 的 cluster.role 运行；role 为空则在菜单里选「主服务器/副节点」。
-#    选「主服务器」→ 看护 uvicorn(:8080 工作台)；选「副节点」→ 看护 gateway.agent(:8090 控制台)。
-#    崩溃自动重启；悬停看状态；菜单可重启/启停/切角色/开机自启/退出。日志在 logs/<role>.log。
-#    Windows 用同一份 scripts/tray.py：见 docs/WINDOWS_AGENT_TASK.md（交给 Windows 上的 Codex 打包发布）。
-
-# C) 常驻后台（无托盘，launchd）：bash scripts/install_service.sh
 ```
 
-打开 **http://127.0.0.1:8080/** 即是 Web 工作台；API 文档在 **/docs**。
+The tray app supervises the backend (auto-restart on crash), shows live status, toggles start/stop/restart, sets autostart, and quits.
 
-`system` 模型（macOS `say`）开箱即用、无需权重，适合先验证链路。
-
----
-
-## 5. 模型
-
-| id | 引擎 | 设备 | 克隆 | 模式 | 启用前提 |
-|----|------|------|------|------|----------|
-| `system` | macOS `say` | CPU | ✗ | 仅 clone | 无（默认可用，仅联调） |
-| `cosyvoice3` | Fun-CosyVoice3-0.5B-2512 | MPS | ✓ | clone/instruct/cross_lingual | 见下 |
-| `f5_tts` | F5TTS_v1_Base | MPS | ✓ | 仅 clone | 见下 |
-
-启用真实模型（已在 `setup_worker.sh` 内置 macOS 适配，可复现）：
+### Run — alternatives
 
 ```bash
-# CosyVoice3
-bash scripts/setup_worker.sh cosyvoice3        # 建 vg-cosyvoice + 克隆官方仓库 + 装依赖
-bash scripts/download_weights.sh cosyvoice3    # 下载权重到 models/Fun-CosyVoice3-0.5B-2512
-
-# F5-TTS（权重首次合成时自动从 HuggingFace 下载）
-bash scripts/setup_worker.sh f5_tts            # 建 vg-f5 + pip install f5-tts
+bash scripts/start.sh            # foreground: alembic upgrade head, then uvicorn at http://127.0.0.1:8080
+bash scripts/install_service.sh  # run the gateway as a background launchd service (no tray)
+pkill -f "uvicorn gateway.main:app"   # stop a foreground/CLI gateway
 ```
 
-模型在 `models.yaml` 里 `enabled: true` 即生效（改完重启网关，或用
-`/v1/settings`、`/v1/models/{id}/config` 热更新）。
+Open the workbench at <http://127.0.0.1:8080>. Quick synth from the CLI or API:
 
-> 性能：本机上两个真实模型都**慢于实时**（RTF≈1.5–2.2），首次冷调用约 25s（含 worker
-> 拉起+加载权重），之后命中缓存即时返回。批量场景建议预生成 + 缓存。
-
----
-
-## 6. 生成模式（mode）
-
-- `clone`（默认）：零样本声音克隆，所有支持克隆的模型可用。
-- `instruct`：自然语言指令控制语气，**仅 `cosyvoice3`**，必须提供 `instruct_text`
-  （如“沉稳克制、纪录片旁白”）。
-- `cross_lingual`：跨语言克隆，**仅 `cosyvoice3`**。
-
-`system` 与 `f5_tts` 只支持 `clone`；对它们传别的 mode 会报 400。
-
----
-
-## 7. 声音克隆与参考音频
-
-克隆音色登记在 `voices.yaml`，每个音色 = 一段参考音频 + **逐字稿**（音频里实际说的话，
-**必须一字不差**）：
-
-```yaml
-voices:
-  - id: narrator_zh
-    name: 中文旁白
-    language: zh
-    ref_audio: voices/narrator_zh/ref.wav
-    ref_text: "这是一段用于声音克隆测试的参考音频，语气清晰自然。"
-    models: [cosyvoice3, f5_tts]    # 留空=所有支持克隆的模型
-```
-
-参考音频建议：单人、干净无噪、**6–10 秒**、结尾留约 1s 静音。约束：CosyVoice 上限 30s；
-F5-TTS 只取前 ~12s。上传/录制时 `voice_store.py` 会统一转成 16k 单声道 WAV 并**自动修剪开头静音**
-（不剪结尾，F5 需要）。内容可任意，但逐字稿必须对应。
-
-支持克隆的模型在 `/v1/tts` 必须指定一个克隆音色；`system` 用内置音色（`Tingting`/`Kyoko`/`Samantha`）。
-
----
-
-## 8. 项目（按项目归类生成）
-
-- 生成时传 `project_id` 把这次生成归到某项目；留空=「未归类」。项目存于 MySQL `projects` 表。
-- 用 `/v1/projects` 增删改查；`/v1/history?project=<id>`（或 `__none__` 查未归类）筛选；
-  `PATCH /v1/history/{id}` 事后改归属。删项目会把其下生成置为未归类（不删音频）。
-- `project_id` 是组织标签，**不影响音频、不进缓存键**。
-
----
-
-## 9. Web 工作台（五个页面）
-
-- **生成工作台**：输文本 → 选项目/模型/音色/模式/语言/语速/格式 → 生成；真实波形播放、下载、最近生成（可一键复制文本）。
-- **音色库**：上传 WAV/MP3/WebM 或浏览器录音（先预热再录，避免吞首字），管理克隆音色。
-- **项目**：新建/改名/删除项目、看每个项目的生成数、跳转到该项目的历史。
-- **生成历史**：按文本/模型/状态/**项目**筛选、分页、播放、下载、复用、删除、行内「移到项目」。
-- **服务设置**：MySQL/缓存/MPS/各模型状态；改全局设置、逐模型启停/改配置。
-
----
-
-## 10. REST API 参考
-
-基址 `http://127.0.0.1:8080`。若 `settings.api_token`（或环境变量 `VG_API_TOKEN`）非空，
-需带 `Authorization: Bearer <token>`。
-
-**合成**
-```
-POST /v1/tts
-  body(JSON): {
-    "text": "要合成的文字",          // 必填
-    "model": "cosyvoice3",          // 必填，见 /v1/models
-    "voice": "narrator_zh",         // 必填，克隆音色或内置音色 id
-    "mode": "clone",                // clone|instruct|cross_lingual，默认 clone
-    "instruct_text": "...",         // mode=instruct 必填
-    "language": "zh",               // 可选 zh/ja/en/...，留空模型自判
-    "speed": 1.0,                   // 0.1–3.0
-    "format": "wav",                // wav|mp3|opus，留空用默认
-    "project_id": "<uuid|null>"     // 可选，归属项目
-  }
-  → 200: 音频字节(audio/wav|mpeg|ogg)；响应头 X-Generation-Id、X-Cache:HIT|MISS
-```
-
-**模型 / 音色**
-```
-GET    /v1/models                         已启用模型及能力
-GET    /v1/voices?model=<id>              某模型可用音色(克隆+内置)
-GET    /v1/voice-library                  全部克隆音色(含 ref_text、audio_url)
-POST   /v1/voices                         新建克隆音色(multipart: name,language,ref_text,models,audio[,voice_id])
-PUT    /v1/voices/{id}                    更新(multipart，audio 可省=保留)
-DELETE /v1/voices/{id}                    删除
-GET    /v1/voices/{id}/audio              下载该音色参考音频
-```
-
-**项目**
-```
-GET    /v1/projects                       项目列表(含 generation_count)
-POST   /v1/projects                       {name, description?, color?}
-PUT    /v1/projects/{id}                  {name?, description?, color?}
-DELETE /v1/projects/{id}                  删除(其下生成置为未归类)
-```
-
-**历史**
-```
-GET    /v1/history?page&page_size&model&status&q&project   分页/筛选(project=__none__ 查未归类)
-GET    /v1/history/{id}/audio             取该次生成音频(已清理则 410)
-PATCH  /v1/history/{id}                   {project_id: <id|null>}  改归属
-DELETE /v1/history/{id}                   删记录(不删磁盘音频)
-```
-
-**设置 / 模型进程 / 系统**
-```
-GET  /v1/settings                         全局设置 + 模型运行态
-PUT  /v1/settings                         {default_model?,default_format?,worker_idle_timeout?,worker_start_timeout?,cache_max_gb?}
-PUT  /v1/models/{id}/config               {enabled?,description?,python?,port?,languages?,options?}
-POST /v1/models/{id}/start|stop|restart   管理 worker 进程
-GET  /v1/system                           MySQL/缓存/MPS/模型状态
-GET  /health                              健康检查
-POST /v1/service/shutdown                 优雅停止服务
-```
-
-命令行快捷合成：`bash scripts/tts.sh "你好" cosyvoice3 narrator_zh out.wav`
-
-curl 示例：
 ```bash
-curl -s -X POST http://127.0.0.1:8080/v1/tts -H 'content-type: application/json' \
+bash scripts/tts.sh "你好" cosyvoice3 narrator_zh out.wav
+
+curl -s -X POST http://127.0.0.1:8080/v1/tts \
+  -H 'content-type: application/json' \
   -d '{"text":"九一八事变后，东北局势急剧变化。","model":"cosyvoice3","voice":"narrator_zh","format":"wav"}' \
   -o out.wav
 ```
 
----
+> After any **backend** change, restart the gateway. After **frontend** changes, run `cd web && npm run build` and refresh — the gateway serves `web/dist` live, no restart needed.
 
-## 11. 配置文件
+## Models
 
-`models.yaml`（节选）：
-```yaml
-settings:
-  host: 127.0.0.1
-  port: 8080
-  api_token: ""             # 非空则需 Bearer 鉴权
-  cache_max_gb: 30          # 缓存上限，超出按 LRU 淘汰
-  worker_idle_timeout: 300  # 秒；worker 空闲超时自动卸载
-  default_model: cosyvoice3
-  default_format: wav
-models:
-  - id: cosyvoice3
-    enabled: true
-    python: /Users/kanxiao/miniconda3/envs/vg-cosyvoice/bin/python  # 该模型的解释器
-    backend: workers.cosyvoice3.backend:CosyVoice3Backend           # 模块:类
-    host: 127.0.0.1
-    port: 8102
-    languages: [zh, en, ja, ko, ...]
-    supports_cloning: true
-    options: { repo_dir: third_party/CosyVoice, model_dir: models/Fun-CosyVoice3-0.5B-2512, device: auto }
-```
+Three models ship in [`models.example.yaml`](models.example.yaml):
 
----
+| Model | Engine | Env | Device | Cloning | Modes | Notes |
+|---|---|---|---|---|---|---|
+| `system` | macOS `say` | gateway env | CPU | No | clone | No weights; built-in voices (Tingting / Kyoko / Samantha). Enabled by default for link testing. Set `enabled: false` on non-macOS nodes. |
+| `cosyvoice3` | Fun-CosyVoice3-0.5B-2512 | `vg-cosyvoice` (py3.10) | auto/mps (Mac), cuda (Win) | Yes | clone, instruct, cross_lingual | ~2.6 GB memory per replica. `options.repo_dir`, `options.model_dir`. Base port 8110, suggested `replicas: 2`. |
+| `f5_tts` | F5TTS_v1_Base | `vg-f5` (py3.10) | auto (Mac), cuda (Win) | Yes | clone | Weights auto-download from HuggingFace on first synth. Base port 8120, `replicas: 1`. |
 
-## 12. 如何新增一个模型（可插拔）
+**Generation modes** (`mode`, default `clone`):
 
-1. `workers/<name>/backend.py` 写一个类，继承 `worker_runtime/base.py:TTSBackend`，实现
-   `synthesize(self, req: SynthRequest) -> bytes`（返回 16-bit PCM 的 WAV 字节；权重首次调用惰性加载）。
-   可选实现 `list_voices()` 暴露内置音色。
-2. 为它建一个 conda 环境并装依赖（可参考 `scripts/setup_worker.sh`）。
-3. 在 `models.yaml` 的 `models:` 加一段（`id` / `python`(该环境解释器) / `backend`(模块:类) /
-   `host` / 唯一 `port` / `languages` / `supports_cloning` / `options`）。
-4. 重启网关。删除模型=删掉这段配置（可选删环境/目录）。
+- `clone` — zero-shot voice cloning (any cloning model).
+- `instruct` — natural-language style control. **Only `cosyvoice3`**; requires non-empty `instruct_text`.
+- `cross_lingual` — cross-lingual cloning. **Only `cosyvoice3`**.
 
-gateway 通过 supervisor 用该 `python -m worker_runtime.server` 拉起子进程，环境变量
-`VG_BACKEND/VG_MODEL_ID/VG_HOST/VG_PORT/VG_OPTIONS` 注入；worker 暴露 `/health` `/info` `/synthesize`。
+Passing any mode other than `clone` to a non-`cosyvoice3` model returns HTTP 400; `instruct` with empty `instruct_text` returns HTTP 400.
 
----
+> The first (cold) call to a real model is slow (~25 s incl. worker spawn + weight load) and both real models run slower than realtime (RTF ~1.5–2.2). Use pre-generation + caching for batch workloads. On macOS do **not** run models in Docker (MPS can't be passed through) — use native processes across conda envs.
 
-## 13. 数据与缓存
+## Adding a model
 
-- **生成音频**：内容寻址存 `cache/<key前2位>/<sha256>.<ext>`，超 `cache_max_gb` 按访问时间 LRU 淘汰。
-- **生成历史**：MySQL `voice_generation.generation_history`（元数据 + 相对音频路径）。
-- **项目**：MySQL `voice_generation.projects`。
-- **克隆音色**：文件 `voices.yaml` + `voices/<id>/ref.wav`（非 DB）。
-- DB 连接：`VG_DATABASE_URL`，默认 `mysql+pymysql://root@127.0.0.1:3306/voice_generation`。
+The gateway is never modified to add a model. There are two plug points.
 
----
+1. **`models.yaml` entry** — add a block under `models:` with `id`, `python` (interpreter path; empty = gateway's own), `backend` (`module.path:ClassName`), `host`, a unique `port`, `languages`, `supports_cloning`, `replicas`, and an `options` dict.
+2. **A `TTSBackend` subclass** — write `workers/<name>/backend.py` subclassing the ABC in [`worker_runtime/base.py`](worker_runtime/base.py) and implement:
 
-## 14. 测试
+   ```python
+   def synthesize(self, req: SynthRequest) -> bytes:  # MUST return 16-bit PCM WAV bytes
+       ...
+   ```
+
+   Load weights lazily on first call. `SynthRequest` carries `text, voice, language, speed, mode, instruct_text, ref_audio_path, ref_text`. Use the helper `pcm_to_wav_bytes(samples, sample_rate)` to encode a float `[-1,1]` or int16 1-D array into mono 16-bit WAV. Optionally override `list_voices() -> list[dict]` to expose built-in voices.
+
+Then: create the conda env + deps (see [`scripts/setup_worker.sh`](scripts/setup_worker.sh)), add the YAML entry, and restart the gateway. Removing a model = delete its YAML block.
+
+> `replicas=N` occupies ports `port..port+N-1`, so leave gaps between models' base ports. Each worker serves only its configured model.
+
+## Voice cloning
+
+Clone voices live on disk in `voices.yaml` + `voices/<id>/ref.wav` (not in the DB). Each voice has `id`, `name`, `language`, `ref_audio`, `ref_text` (the exact transcript of the reference, word-for-word), and `models` (empty = all cloning-capable models).
+
+- A cloning model **requires** a clone voice; the voice must be permitted for that model and its `ref_audio` file must exist (else HTTP 400).
+- Manage voices from the **音色库 / Voice Library** page: upload (WAV/MP3/MP4/WebM, max 20 MB, 3–30 s) or record directly with the Mac mic.
+- Uploads are normalized to **16 kHz mono WAV**; only **leading** silence is trimmed (trailing silence is preserved because F5-TTS needs it).
+
+> Reference-audio quality matters: the transcript must match the audio word-for-word. Recommended a clean, single-speaker 6–10 s clip with ~1 s trailing silence. CosyVoice caps ~30 s; F5-TTS uses only the first ~12 s.
+
+## Projects
+
+A project is an organizational tag stored in the MySQL `projects` table. It does **not** affect audio output and is **excluded from the cache key**, so identical text/model/voice is shared across projects. Deleting a project sets its generations to unassigned (it does not delete audio). Filter history with `/v1/history?project=<id>`, or `project=__none__` for unassigned.
+
+## Web workbench
+
+A React 18 + TypeScript + Vite SPA in [`web/`](web/), built to `web/dist` and served by the gateway on the same origin (default <http://127.0.0.1:8080>). All API calls use same-origin `/v1/*` paths, so no CORS or separate server is needed. Five pages:
+
+- **生成工作台 / Workbench** (`/`) — text → speech. Editor + result player + recent list on the left; a CONTROL panel (project, model, voice, mode, language, format, speed, style instruction) on the right. Generation is asynchronous and polled client-side; in-flight jobs persist in `localStorage` and resume after reload.
+- **音色库 / Voice Library** (`/voices`) — create, edit, delete, and preview clone voices; upload or record reference audio.
+- **项目 / Projects** (`/projects`) — group generations by project (name, description, color).
+- **生成历史 / History** (`/history`) — paginated, filterable history (search, model, status, project); filters sync to the URL. Reuse a generation in the workbench, move it to a project, download, or delete.
+- **服务设置 / Settings** (`/settings`) — health cards (MySQL, cache, Apple MPS, gateway), global settings, cluster runtime + performance metrics, sub-node connect info, and per-model service controls.
+
+## Multi-machine cluster
+
+One **coordinator** (default the Mac) holds the job queue, audio cache, history, and voices in MySQL. **Worker nodes** (the coordinator's embedded agent + a Windows RTX 4060 agent + …) lease jobs, run local inference, and post results back. Worker nodes need neither MySQL nor ffmpeg — transcode and storage happen on the coordinator.
+
+- **Job lifecycle** — each job is a `generation_history` row moving `queued → leased → completed | failed` (also `cancelled`). The queue is implemented purely with MySQL row locks — no extra broker.
+- **Atomic leasing** — nodes claim work via `SELECT ... FOR UPDATE SKIP LOCKED`, so no two nodes grab the same job. Leasing is **per-model** (`{model_id: capacity}`), so an idle `system`/F5 slot never over-claims a busy CosyVoice job.
+- **Fault tolerance** — leases have a TTL (`lease_ttl`, default 120 s). Expired leases requeue (until `max_attempts`, default 3) or fail; on coordinator restart all leftover leased rows reset to `queued`. Slow jobs send heartbeats so they aren't re-dispatched as duplicates.
+- **Dedup** — queued rows with the same cache key reuse already-produced audio.
+- **No node preference** — all online nodes drain the queue in parallel; throughput is the sum of nodes. Real parallelism per model = the sum of that model's replicas across all nodes.
+- **Provenance** — the HTTP response carries an `X-Node` header naming the machine that produced the audio (for cache hits this is the coordinator's `node_id`); history shows "generated by &lt;node name&gt;".
+- **Remote-agent console** at `:8090` — the sub-node's own control panel (connect / disconnect / refresh, capacity, running jobs, the coordinator's node list). The agent connects **only** after the operator presses Connect (`cluster.enabled` defaults to false; the state is persisted to `models.yaml`).
+- **Coordinator-only mode** — set `cluster.coordinator_runs_jobs: false` so the Mac coordinates only and all jobs go to other nodes.
+
+### Networking
+
+Nodes connect over **Tailscale** (stable `100.x` IPs) or the same **LAN** (coordinator's LAN IP or `<hostname>.local`). The coordinator binds `127.0.0.1` by default — to let other machines connect, start with `--host 0.0.0.0` (or set `settings.host: 0.0.0.0`) **and** set `cluster.token` (identical on both ends). The agent's `httpx` client uses `trust_env=False` to bypass a system proxy/VPN; verify `curl http://<host>:8080/health` returns 200.
 
 ```bash
-# 后端(需本机 MySQL；用独立库 voice_generation_test)
-conda run -n vg-gateway python -m pytest -q
-# 前端
-cd web && npm test          # vitest
-cd web && npm run build     # tsc 类型检查 + 构建
+# expose the coordinator to other machines
+conda run -n vg-gateway uvicorn gateway.main:app --host 0.0.0.0 --port 8080
+
+# start a worker node agent (console at http://127.0.0.1:8090)
+bash scripts/agent.sh                                   # macOS / Linux
+./scripts/agent.ps1 -CoordinatorUrl http://<host>:8080 -ClusterToken <token> -NodeId win-4060 -NodeName 'Windows 4060'   # Windows
 ```
 
-> 注：测试库用 `create_all` 建表，不会给旧表加新列。**改了 ORM 列后**需先 DROP 测试库里对应旧表，
-> 让其按新结构重建；生产库则靠 `alembic upgrade head`。
+See [`docs/CLUSTER.md`](docs/CLUSTER.md).
 
----
+## Tray app
 
-## 15. 给 AI 协作者的关键约束
+One codebase ([`scripts/tray.py`](scripts/tray.py), `pystray` + Pillow) runs in the **macOS menu bar** and the **Windows system tray**.
 
-- **改后端需重启网关**（`pkill -f "uvicorn gateway.main:app"` 后 `bash scripts/start.sh`）；
-  **改前端需 `npm run build`**（gateway 从 `web/dist` 实时托管，刷新即可，无需重启网关）。
-- 新增 GET 路由必须放在 `gateway/main.py` 末尾的 SPA 兜底 `@app.get("/{path:path}")` **之前**，否则被它吞掉。
-- `conda run` 会吞掉 heredoc 的 stdout；调试时把脚本写文件、输出重定向到文件再读。
-- macOS 上不要用 Docker 跑模型（无法透传 MPS）；用原生进程 + 多 conda 环境。
-- 默认只监听 `127.0.0.1`、无鉴权，仅供本机使用。
+- **Role at launch** — read from `models.yaml` `cluster.role`. If empty, the menu offers *Start as coordinator / Start as agent* and only persists + starts once chosen. Coordinator spawns the uvicorn gateway (`:8080`); agent spawns `python -m gateway.agent` (`:8090` console + lease loop).
+- **Supervision** — a thread keeps the backend alive: if it exited and should be running, it auto-restarts with exponential backoff (up to 30 s).
+- **Status** — polled every 3 s. Coordinator shows `running · nodes N · queue D`; agent shows `connected/connecting/not-connected · running K/total slots`. The icon switches online (copper) vs offline (gray).
+- **Menu** — status · open UI · stop/start · restart · switch role · autostart · quit. Quitting the tray stops **that machine's** backend.
+- **Autostart** — macOS uses a LaunchAgent plist; Windows uses the registry `Run` key.
+- **Coordinator startup** — on macOS the tray runs `brew services start mysql` then `alembic upgrade head` before launching uvicorn.
 
-详细设计见 [docs/DESIGN.md](docs/DESIGN.md)。接入「歴史」项目见 [examples/](examples/)。
+**Windows packaging is delegated** to Codex-on-Windows via [`docs/WINDOWS_AGENT_TASK.md`](docs/WINDOWS_AGENT_TASK.md). The contract: **reuse `scripts/tray.py` as-is** (it already handles the Windows branches — `CREATE_NEW_PROCESS_GROUP`, `winreg` autostart, tray icon) and do **not** change the cluster protocol. Windows deliverables include `scripts/start_tray.bat`, `install_autostart.ps1` / `uninstall_autostart.ps1`, and an optional PyInstaller `VoiceGeneration.exe`.
+
+> PyInstaller note: the frozen exe must run with the **repo root as its working directory** (or it can't find `models.yaml` and the model conda envs). A `pythonw.exe scripts/tray.py` shortcut is a documented, freeze-free fallback. The repo must stay on disk on every worker regardless — workers launch from the repo dir using their conda envs.
+
+## REST API
+
+Most user-facing routes require `Authorization: Bearer <token>` only when `settings.api_token` (or `VG_API_TOKEN`) is set. Cluster routes (`/v1/cluster/*`) use a separate `cluster.token`.
+
+> **Security default:** the service binds `127.0.0.1` with **no auth** — intended for local use only. Expose it to other machines only by setting `settings.host: 0.0.0.0` **and** setting both `api_token` and `cluster.token`.
+
+| Method & path | Description |
+|---|---|
+| `GET /health` | Health check `{ok, version}` |
+| `POST /v1/tts` | Synthesize; returns audio + `X-Generation-Id`, `X-Cache` (HIT\|MISS), `X-Node` |
+| `POST /v1/generations` | Submit async generation (200 cache hit, 202 queued) |
+| `GET /v1/generations/{id}` | Poll a generation's status |
+| `DELETE /v1/generations/{id}` | Cancel a queued generation (409 if leased) |
+| `GET /v1/models` | List enabled models |
+| `GET /v1/voices?model=<id>` | List voices (clone + built-in); config-only, never wakes a worker |
+| `GET /v1/voice-library` | List all clone voices |
+| `POST/PUT/DELETE /v1/voices[/{id}]` | Create / update / delete a clone voice (multipart) |
+| `GET /v1/voices/{id}/audio` | Download a clone voice's reference WAV |
+| `GET /v1/history` | Paginated/filtered history (`page, page_size, model, status, q, project`) |
+| `PATCH /v1/history/{id}` | Reassign a generation's project |
+| `GET /v1/history/{id}/audio` | Fetch audio (410 if evicted) |
+| `DELETE /v1/history/{id}` | Delete a record (keeps disk audio) |
+| `GET/POST/PUT/DELETE /v1/projects[/{id}]` | Manage projects |
+| `GET /v1/settings` · `PUT /v1/settings` | Global settings + per-model runtime state; update writes `models.yaml` and hot-reloads |
+| `PUT /v1/models/{id}/config` | Update one model's config (validates ports/paths/device) |
+| `POST /v1/models/{id}/start\|stop\|restart` | Warm / stop / restart a model's replica pool |
+| `GET /v1/system` | Service/version/platform, MPS flags, MySQL state, cache usage, models |
+| `POST /v1/service/shutdown` | Gracefully stop the service |
+| `POST /v1/cluster/register` | Agent registers (cluster-token auth) |
+| `POST /v1/cluster/lease` | Agent long-polls to lease jobs by per-model capacity |
+| `GET /v1/cluster/asset/{voice_id}` | Agent downloads a clone reference WAV |
+| `POST /v1/cluster/jobs/{id}/result\|fail\|heartbeat` | Agent uploads result / reports failure / extends lease |
+| `GET /v1/cluster/nodes` | Cluster overview: self, nodes, `queue_depth` |
+| `GET /v1/cluster/connect-info` | Sub-node connect info (candidate URLs Tailscale-first, token) |
+| `GET /v1/jobs/{id}` | Fetch a single job/history row |
+| `GET /` · `GET /{path:path}` | Serve the web SPA (catch-all must remain last) |
+
+> Any new `GET` route **must** be registered before the catch-all `@app.get('/{path:path}')` SPA fallback at the bottom of [`gateway/main.py`](gateway/main.py), or the fallback will swallow it.
+
+## Configuration
+
+`models.yaml` is **git-ignored** and per-machine. Start from [`models.example.yaml`](models.example.yaml) (`cp models.example.yaml models.yaml`). `PUT /v1/settings` and `PUT /v1/models/{id}/config` rewrite it atomically and keep a `models.yaml.bak`.
+
+### Key settings
+
+| Key | Default | Description |
+|---|---|---|
+| `settings.host` | `127.0.0.1` | Bind address; set `0.0.0.0` to accept other machines |
+| `settings.port` | `8080` | Gateway HTTP port (also serves the web UI) |
+| `settings.api_token` | `''` | If non-empty, REST requires `Bearer` (env `VG_API_TOKEN`) |
+| `settings.cache_dir` / `cache_max_gb` | `cache` / `3.0` | Disk cache dir + size cap (GB); LRU-evicted. Config default is `3.0`; `models.example.yaml` uses `30.0`. |
+| `settings.worker_idle_timeout` / `worker_start_timeout` | `300` · `180` | Idle reclaim · start wait (seconds). Config default idle is `300`; `models.example.yaml` uses `3600`. |
+| `settings.default_model` / `default_format` | `cosyvoice3` / `wav` | Defaults when the request omits them |
+| `settings.voices_file` | `voices.yaml` | Clone-voice manifest path |
+
+### Cluster keys
+
+| Key | Default | Description |
+|---|---|---|
+| `cluster.role` | `''` | `''` (pick at tray launch) \| `coordinator` \| `agent` |
+| `cluster.node_id` / `node_name` | `local` | Unique node id / display name |
+| `cluster.coordinator_url` | `''` | Agent: the coordinator URL (leave empty on coordinator) |
+| `cluster.token` | `''` | Shared cluster secret; required when exposing the coordinator |
+| `cluster.coordinator_runs_jobs` | `true` | Coordinator also runs inference via its embedded agent |
+| `cluster.max_concurrency` | `1` | Node concurrency hint (this node's own inference parallelism) |
+| `cluster.poll_interval` | `1.0` | Agent long-poll / idle sleep interval (seconds) |
+| `cluster.lease_ttl` / `node_timeout` / `max_attempts` | `120` / `60` / `3` | Lease TTL · offline timeout · max attempts |
+| `cluster.agent_host` / `agent_port` | `127.0.0.1` / `8090` | Sub-node web console bind / port |
+| `cluster.enabled` | `false` | Whether the agent actively connects (toggled by the `:8090` console) |
+
+### Per-model keys
+
+`id`, `enabled`, `description`, `python` (interpreter; empty = gateway's), `backend` (`module:Class`), `host`, `port` (replica base), `languages`, `supports_cloning`, `replicas` (parallel processes, 1–8), `options` (e.g. `device: auto|mps|cpu|cuda`, `repo_dir`, `model_dir`, `model`), and `placement.allow` (list of node_ids permitted to run the model; empty = all).
+
+### Environment overrides
+
+`VG_API_TOKEN`, `VG_CLUSTER_ROLE`, `VG_NODE_ID`, `VG_NODE_NAME`, `VG_COORDINATOR_URL`, `VG_CLUSTER_TOKEN`, `VG_DATABASE_URL`, `VG_FFMPEG`, `VG_FFPROBE`.
+
+> On a Windows worker: point each model's `python` at that env's `python.exe`, set `options.device: cuda` (verify `torch.cuda.is_available()`), point `model_dir`/`repo_dir` at local paths, and set the `system` model `enabled: false`.
+
+## Data & cache
+
+- **MySQL** (`voice_generation`; override with `VG_DATABASE_URL`, default `mysql+pymysql://root@127.0.0.1:3306/voice_generation`). Three tables: `generation_history`, `projects`, `cluster_nodes`. Timestamps are stored as naive UTC and serialized with a `Z` suffix.
+- **Alembic** — `alembic upgrade head` auto-creates the DB then applies migrations (a linear chain of 4 revisions). `init_database()` also runs `create_all`, so tables can appear from the ORM; keep Alembic the source of truth in production.
+- **Content-addressed disk cache** ([`gateway/cache.py`](gateway/cache.py)) — audio stored under `cache/<key[:2]>/<key>.<ext>`, keyed by SHA-256 of the output-determining params (model, voice, language, text, speed, format, mode, instruct_text, options, ref, ref_text). It **excludes** `project_id` and `assigned_node`, so identical content is shared and deduplicated. LRU eviction over `cache_max_gb` never touches `_logs`.
+- **Transcode** ([`gateway/audio.py`](gateway/audio.py)) — workers return WAV; the gateway transcodes on demand to `wav | mp3 | opus` via system ffmpeg. `ffmpeg`/`ffprobe` are discovered via `VG_FFMPEG`/`VG_FFPROBE`, `PATH`, then common Homebrew dirs.
+- **File-backed voices** ([`gateway/voice_store.py`](gateway/voice_store.py)) — `voices.yaml` (atomic write + `.bak`) and `voices/<id>/ref.wav`. Voice IDs match `^[A-Za-z0-9_-]{2,64}$`.
+
+## Testing
+
+Backend tests need a live MySQL at `root@127.0.0.1:3306` (empty password); `tests/conftest.py` forces the `voice_generation_test` DB so runs never touch your real history.
+
+```bash
+conda run -n vg-gateway python -m pytest -q   # backend
+cd web && npm test                            # frontend (vitest)
+```
+
+> Tests use `create_all` (won't add new columns to existing tables). After changing ORM columns, drop the affected `voice_generation_test` tables so they're rebuilt.
+
+## Repository layout
+
+```
+gateway/            FastAPI gateway: main.py (all routes), supervisor.py, cluster.py,
+                    agent.py, config.py, database.py, cache.py, audio.py, voice_store.py
+worker_runtime/     worker server + TTSBackend ABC (base.py)
+workers/<model>/    per-model backends (system, cosyvoice3, f5_tts)
+web/                React + TS + Vite workbench (built to web/dist)
+scripts/            setup/run/build scripts + tray.py + make_icons.py + agent.sh/ps1
+packaging/          Info.plist, icons, .app launcher
+                    (packaging/windows/ — PyInstaller spec — is a delegated Windows
+                     deliverable, not built on the Mac side; see WINDOWS_AGENT_TASK.md)
+alembic/            DB migrations
+examples/           history_audio_router.py, batch_pregenerate.py (歴史 use case)
+tests/              backend test suite
+models.example.yaml model registry template (copy to models.yaml)
+```
+
+## Documentation
+
+- [`docs/CLUSTER.md`](docs/CLUSTER.md) — multi-machine cluster setup and operation
+- [`docs/DESIGN.md`](docs/DESIGN.md) — architecture and design notes
+- [`docs/WINDOWS_AGENT_TASK.md`](docs/WINDOWS_AGENT_TASK.md) — Windows agent/tray packaging contract
