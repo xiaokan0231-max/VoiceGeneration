@@ -20,7 +20,8 @@ VoiceGeneration.app/
 
 # PyInstaller Windows 构建产物
 build/
-dist/
+dist/*
+!dist/VoiceGeneration.exe
 
 # 机器相关配置：各机器从 models.example.yaml 复制成 models.yaml 自行修改
 # （避免多机 git pull 时反复冲突）
