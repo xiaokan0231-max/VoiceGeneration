@@ -7,6 +7,7 @@ sqlalchemy>=2.0
 pymysql>=1.1
 alembic>=1.13
 python-multipart>=0.0.9
-pystray>=0.19            # 跨平台托盘程序(mac 菜单栏 / windows 托盘)
+pystray>=0.19            # Windows/Linux 托盘
+rumps>=0.4 ; sys_platform == "darwin"   # macOS 菜单栏（原生，状态项稳定显示）
 pillow>=10.0            # 托盘/应用图标生成
 # 注：音频转码用系统 ffmpeg（已通过 brew 安装）
