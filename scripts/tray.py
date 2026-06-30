@@ -376,12 +376,24 @@ def run_mac(ctrl: BackendController) -> None:
             ctrl.stop_all()
             rumps.quit_application()
 
+    print(f"[mac] run_mac role={ctrl.role!r} icon_on_exists={os.path.exists(icon_on)}")
     ctrl.start()
     _notify("VoiceGeneration 已在菜单栏运行", _tip(ctrl.role))
     app = MacTray()
+    # 关键：.app 启动器 exec python 后，进程默认是 Prohibited(2)，Dock 与状态栏都不显示。
+    # rumps 自己不设激活策略，必须在它进入 run loop（创建 NSStatusItem）之前显式设为
+    # Regular(0)：既有 Dock 图标（明确的“在运行”反馈），状态栏图标也能稳定显示。
+    try:
+        import AppKit
+        ns = AppKit.NSApplication.sharedApplication()
+        ns.setActivationPolicy_(AppKit.NSApplicationActivationPolicyRegular)
+        print("[mac] activation policy now:", ns.activationPolicy(), "(0=Regular)")
+    except Exception as exc:  # noqa: BLE001
+        print("[mac] set activation policy FAILED:", exc)
     if os.environ.get("VG_TRAY_SELFTEST"):      # 自测：跑几秒自动退出
         rumps.Timer(lambda _: rumps.quit_application(),
                     float(os.environ["VG_TRAY_SELFTEST"])).start()
+    print("[mac] entering rumps run loop")
     app.run()
 
 
@@ -452,9 +464,39 @@ def run_pystray(ctrl: BackendController) -> None:
     icon.run(setup=setup)
 
 
+def _error_dialog(text: str) -> None:
+    """弹一个可见的报错框（而不是静默失败）。"""
+    if sys.platform != "darwin":
+        return
+    safe = text.replace("\\", "\\\\").replace('"', '\\"')[:500]
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'display dialog "VoiceGeneration 出错：\\n{safe}" with title "VoiceGeneration" '
+             'buttons {"OK"} with icon caution'],
+            capture_output=True, timeout=30)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def main() -> None:
+    # 把托盘自身的输出落到 logs/tray.log —— 经 .app 启动时 stdout/stderr 本来无处可去，
+    # 出问题就成了「点了没反应」。这样既有日志可查，崩溃还会弹框提示。
+    LOG_DIR.mkdir(exist_ok=True)
+    log = open(LOG_DIR / "tray.log", "a", buffering=1, encoding="utf-8")
+    sys.stdout = sys.stderr = log
+    print(f"\n=== tray start pid={os.getpid()} {sys.platform} {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
+    try:
+        controller = BackendController()
+        print(f"[main] role={controller.role!r} host={controller.host} port={controller.port}")
+        (run_mac if sys.platform == "darwin" else run_pystray)(controller)
+    except Exception:
+        import traceback
+        tb = traceback.format_exc()
+        print(tb)
+        _error_dialog(tb.strip().splitlines()[-1] if tb.strip() else "未知错误")
+        raise
+
+
 if __name__ == "__main__":
-    controller = BackendController()
-    if sys.platform == "darwin":
-        run_mac(controller)
-    else:
-        run_pystray(controller)
+    main()
