@@ -2,6 +2,8 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import '@testing-library/jest-dom/vitest'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import Workbench from './Workbench'
+import { ToastProvider } from '../components/Feedback'
+import { GenerationProvider } from '../context/GenerationContext'
 
 const response = (value: unknown) => Promise.resolve({ ok: true, json: () => Promise.resolve(value) } as Response)
 
@@ -20,7 +22,7 @@ describe('Workbench', () => {
   afterEach(() => vi.unstubAllGlobals())
 
   it('switches to instruct mode and enforces a style instruction', async () => {
-    render(<Workbench historyVersion={0} projects={[]} onProjectsChange={() => undefined} onGenerated={() => undefined} />)
+    render(<ToastProvider><GenerationProvider><Workbench projects={[]} onProjectsChange={() => undefined} /></GenerationProvider></ToastProvider>)
     await waitFor(() => expect(screen.getByText('中文旁白')).toBeTruthy())
     fireEvent.click(screen.getByRole('button', { name: '指令' }))
     expect(screen.getByText('风格指令（必填）')).toBeTruthy()

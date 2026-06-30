@@ -1,5 +1,5 @@
 import type {
-  ClusterInfo, ConnectInfo, GenerationDraft, HistoryItem, HistoryResponse, ModelInfo,
+  ClusterInfo, ConnectInfo, GenerationDraft, GenerationTask, HistoryItem, HistoryResponse, ModelInfo,
   ProjectDetail, SettingsInfo, SynthesisResult, SystemInfo, VoiceDetail, VoiceInfo,
 } from './types'
 
@@ -22,7 +22,7 @@ export const api = {
   models: () => jsonRequest<ModelInfo[]>('/v1/models'),
   voices: (model: string) => jsonRequest<VoiceInfo[]>(`/v1/voices?model=${encodeURIComponent(model)}`),
   voiceLibrary: () => jsonRequest<VoiceDetail[]>('/v1/voice-library'),
-  history: (params = '') => jsonRequest<HistoryResponse>(`/v1/history${params ? `?${params}` : ''}`),
+  history: (params = '', signal?: AbortSignal) => jsonRequest<HistoryResponse>(`/v1/history${params ? `?${params}` : ''}`, { signal }),
   system: () => jsonRequest<SystemInfo>('/v1/system'),
   settings: () => jsonRequest<SettingsInfo>('/v1/settings'),
   synthesize: async (draft: GenerationDraft): Promise<SynthesisResult> => {
@@ -40,6 +40,11 @@ export const api = {
       cache: response.headers.get('X-Cache') || '',
     }
   },
+  submitGeneration: (draft: GenerationDraft) => jsonRequest<GenerationTask>('/v1/generations', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(draft),
+  }),
+  generation: (id: string, signal?: AbortSignal) => jsonRequest<GenerationTask>(`/v1/generations/${id}`, { signal }),
+  cancelGeneration: (id: string) => jsonRequest<GenerationTask>(`/v1/generations/${id}`, { method: 'DELETE' }),
   deleteHistory: (id: string) => jsonRequest<{ ok: boolean }>(`/v1/history/${id}`, { method: 'DELETE' }),
   saveSettings: (body: Record<string, unknown>) => jsonRequest<SettingsInfo>('/v1/settings', {
     method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),

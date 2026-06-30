@@ -19,7 +19,7 @@ import httpx
 from fastapi import (
     Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile,
 )
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text as sql_text
 
@@ -67,6 +67,9 @@ class App:
         self.config = new_config
         self.supervisor.settings = new_config.settings
         self.cache.max_bytes = int(new_config.settings.cache_max_gb * 1024**3)
+        if self.embedded:
+            await self.embedded.sync_registration(force=True)
+            self.embedded.publish_runtime()
 
     def reload_voices(self) -> None:
         self.config = load_config()
@@ -132,11 +135,11 @@ async def _cluster_reaper(state: App) -> None:
 
 
 async def _wait_for_job(job_id: str, timeout: float):
-    """轮询等待任务到终态（completed/failed）。返回行或 None(超时)。"""
+    """轮询等待任务到终态。返回行或 None(超时)。"""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         row = await asyncio.to_thread(get_generation, job_id)
-        if row and row.status in ("completed", "failed"):
+        if row and row.status in ("completed", "failed", "cancelled"):
             return row
         await asyncio.sleep(0.25)
     return None
@@ -215,6 +218,73 @@ def _duration_from_file(path: Path) -> float | None:
 
 def _relative(path: Path) -> str:
     return str(path.resolve().relative_to(ROOT.resolve()))
+
+
+async def _submit_generation(state: App, body: TTSRequest):
+    """Validate and persist one generation, returning ``(row, cached_bytes)``."""
+    config = state.config
+    model = config.model(body.model)
+    if not model or not model.enabled:
+        raise HTTPException(404, f"未找到已启用的模型: {body.model}")
+    if body.mode != "clone" and model.id != "cosyvoice3":
+        raise HTTPException(400, f"模型 {model.id} 不支持 {body.mode} 模式")
+    if body.mode == "instruct" and not (body.instruct_text or "").strip():
+        raise HTTPException(400, "指令控制模式必须填写风格指令")
+
+    fmt = body.format or config.settings.default_format
+    if fmt not in {"wav", "mp3", "opus"}:
+        raise HTTPException(400, f"不支持的输出格式: {fmt}")
+
+    try:
+        ref_audio_path, ref_text, _ = state.resolve_ref(model, body.voice)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    cache_key = state.cache.key({
+        "model": model.id,
+        "voice": body.voice,
+        "language": body.language,
+        "text": body.text,
+        "speed": body.speed,
+        "format": fmt,
+        "mode": body.mode,
+        "instruct_text": body.instruct_text or "",
+        "model_options": model.options,
+        "ref": ref_audio_path or "",
+        "ref_text": ref_text or "",
+    })
+    project_id = body.project_id or None
+    if project_id and not get_project(project_id):
+        raise HTTPException(404, f"未找到项目: {project_id}")
+
+    common = {
+        "text": body.text, "model_id": model.id, "voice_id": body.voice,
+        "voice_name": _voice_name(config, body.voice), "project_id": project_id,
+        "mode": body.mode, "language": body.language, "speed": body.speed,
+        "format": fmt, "instruct_text": body.instruct_text, "cache_key": cache_key,
+    }
+    cached = state.cache.get(cache_key, fmt)
+    if cached:
+        data = await asyncio.to_thread(cached.read_bytes)
+        row = new_generation(
+            **common, status="completed", assigned_node=state.node_id,
+            audio_path=_relative(cached), mime_type=media_type(fmt), byte_size=len(data),
+            duration_seconds=await asyncio.to_thread(_duration_from_file, cached),
+            cache_hit=True, elapsed_seconds=0.0,
+        )
+        await asyncio.to_thread(finish_generation, row.id)
+        return get_generation(row.id), data
+
+    return new_generation(**common, status="queued", priority=0), None
+
+
+def _generation_payload(row) -> dict:
+    payload = history_dict(
+        row, project_name_map().get(row.project_id),
+        cluster.node_name_map().get(row.assigned_node),
+    )
+    payload["audio_url"] = f"/v1/history/{row.id}/audio" if payload["audio_available"] else None
+    return payload
 
 
 def _parse_models(value: str | None) -> list[str]:
@@ -324,77 +394,24 @@ async def tts(
 ):
     state = get_state(request)
     _require_token(state, authorization)
-    config = state.config
-    model = config.model(body.model)
-    if not model or not model.enabled:
-        raise HTTPException(404, f"未找到已启用的模型: {body.model}")
-    if body.mode != "clone" and model.id != "cosyvoice3":
-        raise HTTPException(400, f"模型 {model.id} 不支持 {body.mode} 模式")
-    if body.mode == "instruct" and not (body.instruct_text or "").strip():
-        raise HTTPException(400, "指令控制模式必须填写风格指令")
-
-    fmt = body.format or config.settings.default_format
-    if fmt not in {"wav", "mp3", "opus"}:
-        raise HTTPException(400, f"不支持的输出格式: {fmt}")
-
-    try:
-        ref_audio_path, ref_text, _ = state.resolve_ref(model, body.voice)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-
-    cache_key = state.cache.key({
-        "model": model.id,
-        "voice": body.voice,
-        "language": body.language,
-        "text": body.text,
-        "speed": body.speed,
-        "format": fmt,
-        "mode": body.mode,
-        "instruct_text": body.instruct_text or "",
-        "model_options": model.options,
-        "ref": ref_audio_path or "",
-        "ref_text": ref_text or "",
-    })
-    # project_id 只是组织标签，不进 cache_key —— 同参数不同项目共享缓存音频。
-    project_id = body.project_id or None
-    if project_id and not get_project(project_id):
-        raise HTTPException(404, f"未找到项目: {project_id}")
-
-    base_headers = {"Content-Disposition": f'attachment; filename="voice.{fmt}"'}
-
-    # 命中缓存：直接记一条完成记录并返回（X-Node = 本协调端）。
-    cached = state.cache.get(cache_key, fmt)
-    if cached:
-        data = await asyncio.to_thread(cached.read_bytes)
-        record = new_generation(
-            text=body.text, model_id=model.id, voice_id=body.voice,
-            voice_name=_voice_name(config, body.voice), project_id=project_id,
-            mode=body.mode, language=body.language, speed=body.speed, format=fmt,
-            instruct_text=body.instruct_text, cache_key=cache_key, status="completed",
-            assigned_node=state.node_id, audio_path=_relative(cached),
-            mime_type=media_type(fmt), byte_size=len(data),
-            duration_seconds=await asyncio.to_thread(_duration_from_file, cached),
-            cache_hit=True, elapsed_seconds=0.0,
-        )
-        await asyncio.to_thread(finish_generation, record.id)
-        return Response(content=data, media_type=media_type(fmt), headers={
+    record, cached_data = await _submit_generation(state, body)
+    base_headers = {"Content-Disposition": f'attachment; filename="voice.{record.format}"'}
+    if cached_data is not None:
+        return Response(content=cached_data, media_type=media_type(record.format), headers={
             **base_headers, "X-Generation-Id": record.id, "X-Cache": "HIT",
             "X-Node": state.node_id,
         })
 
     # 未命中：入队，等任意工作节点（Mac 内置 agent / 远程 agent）完成。
-    record = new_generation(
-        text=body.text, model_id=model.id, voice_id=body.voice,
-        voice_name=_voice_name(config, body.voice), project_id=project_id,
-        mode=body.mode, language=body.language, speed=body.speed, format=fmt,
-        instruct_text=body.instruct_text, cache_key=cache_key, status="queued",
-        priority=0,
+    row = await _wait_for_job(
+        record.id, state.config.settings.worker_start_timeout + 900,
     )
-    row = await _wait_for_job(record.id, config.settings.worker_start_timeout + 900)
     if row is None:
         raise HTTPException(504, "生成超时：没有可用工作节点或排队过久")
     if row.status == "failed":
         raise HTTPException(502, f"语音生成失败：{row.error_message}")
+    if row.status == "cancelled":
+        raise HTTPException(409, "生成任务已取消")
     path = audio_file(row)
     if not path:
         raise HTTPException(502, "生成完成但音频缺失")
@@ -403,6 +420,48 @@ async def tts(
         **base_headers, "X-Generation-Id": record.id, "X-Cache": "MISS",
         "X-Node": row.assigned_node or "",
     })
+
+
+@app.post("/v1/generations")
+async def generation_create(
+    request: Request, body: TTSRequest,
+    authorization: str | None = Depends(check_auth),
+):
+    state = get_state(request)
+    _require_token(state, authorization)
+    row, cached_data = await _submit_generation(state, body)
+    return JSONResponse(
+        status_code=200 if cached_data is not None else 202,
+        content=_generation_payload(row),
+    )
+
+
+@app.get("/v1/generations/{generation_id}")
+async def generation_get(
+    generation_id: str, request: Request,
+    authorization: str | None = Depends(check_auth),
+):
+    state = get_state(request)
+    _require_token(state, authorization)
+    row = await asyncio.to_thread(get_generation, generation_id)
+    if not row:
+        raise HTTPException(404, "未找到生成任务")
+    return _generation_payload(row)
+
+
+@app.delete("/v1/generations/{generation_id}")
+async def generation_cancel(
+    generation_id: str, request: Request,
+    authorization: str | None = Depends(check_auth),
+):
+    state = get_state(request)
+    _require_token(state, authorization)
+    outcome = await asyncio.to_thread(cluster.cancel_queued_job, generation_id)
+    if outcome == "missing":
+        raise HTTPException(404, "未找到生成任务")
+    if outcome == "conflict":
+        raise HTTPException(409, "任务已被 Worker 领取，无法安全取消")
+    return _generation_payload(get_generation(generation_id))
 
 
 @app.get("/v1/history")
@@ -671,6 +730,8 @@ async def model_start(model_id: str, request: Request, authorization: str | None
         await state.supervisor.ensure_running(model_id)
     except Exception as exc:
         raise HTTPException(502, str(exc)) from exc
+    if state.embedded:
+        state.embedded.publish_runtime()
     return {"ok": True, "loaded": True}
 
 
@@ -682,6 +743,8 @@ async def model_stop(model_id: str, request: Request, authorization: str | None 
         await state.supervisor.stop(model_id)
     except KeyError as exc:
         raise HTTPException(404, "未找到模型") from exc
+    if state.embedded:
+        state.embedded.publish_runtime()
     return {"ok": True, "loaded": False}
 
 
@@ -695,6 +758,8 @@ async def model_restart(model_id: str, request: Request, authorization: str | No
         raise HTTPException(404, "未找到模型") from exc
     except Exception as exc:
         raise HTTPException(502, str(exc)) from exc
+    if state.embedded:
+        state.embedded.publish_runtime()
     return {"ok": True, "loaded": True}
 
 

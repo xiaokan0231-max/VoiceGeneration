@@ -55,7 +55,7 @@ export interface HistoryItem extends GenerationDraft {
   project_name: string | null
   assigned_node: string | null
   node_name: string | null
-  status: 'queued' | 'leased' | 'running' | 'completed' | 'failed'
+  status: 'queued' | 'leased' | 'running' | 'completed' | 'failed' | 'cancelled'
   duration_seconds: number | null
   byte_size: number | null
   cache_hit: boolean
@@ -64,6 +64,10 @@ export interface HistoryItem extends GenerationDraft {
   audio_available: boolean
   created_at: string
   completed_at: string | null
+}
+
+export interface GenerationTask extends HistoryItem {
+  audio_url: string | null
 }
 
 export interface HistoryResponse {
@@ -121,6 +125,7 @@ export interface ClusterNodeInfo {
   started_workers: number | null
   working_workers: number
   total_speed: number | null
+  latest_speed: number | null
   average_speed_30m: number | null
   samples_30m: number
   metrics_updated_at: number | null
