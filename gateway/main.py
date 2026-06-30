@@ -30,7 +30,7 @@ from .config import (
     ROOT, AppConfig, Voice, load_config, load_raw_models, save_raw_models,
 )
 from . import cluster
-from .agent import EmbeddedAgent
+from .agent import EmbeddedAgent, run_worker
 from .database import (
     audio_file, create_project, db_session, delete_generation, delete_project,
     finish_generation, get_generation, get_project, history_dict, init_database,
@@ -360,6 +360,13 @@ async def list_voices(
                         id=voice.id, name=voice.name, language=voice.language,
                         kind="clone", model=model_cfg.id,
                     ))
+        # 非克隆模型（如 Style-Bert-VITS2）的内置音色在 models.yaml 的 options.voices 里
+        # 静态声明，gateway 直接据此列出，无需唤醒重型 worker。
+        for voice in (model_cfg.options.get("voices") or []):
+            result.append(VoiceInfo(
+                id=voice["id"], name=voice.get("name", voice["id"]),
+                language=voice.get("language", ""), kind="builtin", model=model_cfg.id,
+            ))
         if model_cfg.id == "system":
             from workers.system.backend import VOICES
             for voice in VOICES:
@@ -385,6 +392,68 @@ async def voice_library(request: Request, authorization: str | None = Depends(ch
         }
         for voice in state.config.voices
     ]
+
+
+# 各语言的试听示例句（用于在音色库里快速听到某个模型/音色的声音）
+_PREVIEW_SAMPLES = {
+    "ja": "こんにちは。これは音声のサンプルです。どうぞよろしくお願いします。",
+    "zh": "你好，这是一段声音示例，希望你会喜欢。",
+    "en": "Hello, this is a voice sample. Nice to meet you.",
+}
+
+
+def _preview_language(config: AppConfig, model, voice_id: str) -> str:
+    clone = config.clone_voice(voice_id)
+    if clone:
+        return clone.language
+    for v in (model.options.get("voices") or []):
+        if v.get("id") == voice_id:
+            return v.get("language", "ja")
+    if model.id == "system":
+        from workers.system.backend import VOICES
+        for v in VOICES:
+            if v["id"] == voice_id:
+                return v["language"]
+    return (model.languages or ["ja"])[0]
+
+
+@app.get("/v1/voices/{model_id}/{voice_id}/preview")
+async def voice_preview(model_id: str, voice_id: str, request: Request,
+                        authorization: str | None = Depends(check_auth)):
+    """合成一句固定示例供试听：走缓存、不写历史，仅本机可运行任务时可用。"""
+    state = get_state(request)
+    _require_token(state, authorization)
+    model = state.config.model(model_id)
+    if not model or not model.enabled:
+        raise HTTPException(404, f"未找到已启用的模型: {model_id}")
+    lang = _preview_language(state.config, model, voice_id)
+    text = _PREVIEW_SAMPLES.get(lang, _PREVIEW_SAMPLES["ja"])
+    try:
+        ref_audio_path, ref_text, _ = state.resolve_ref(model, voice_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    cache_key = state.cache.key({
+        "preview": 1, "model": model.id, "voice": voice_id, "text": text,
+        "language": lang, "model_options": model.options,
+        "ref": ref_audio_path or "", "ref_text": ref_text or "",
+    })
+    cached = state.cache.get(cache_key, "wav")
+    if cached is not None:
+        data = await asyncio.to_thread(cached.read_bytes)
+        return Response(content=data, media_type="audio/wav", headers={"X-Cache": "HIT"})
+    if not state.config.settings.cluster.coordinator_runs_jobs:
+        raise HTTPException(503, "本机未启用本地合成（coordinator_runs_jobs=false），无法试听")
+    payload = {
+        "text": text, "voice": voice_id, "language": lang, "speed": 1.0,
+        "mode": "clone", "instruct_text": None,
+        "ref_audio_path": ref_audio_path, "ref_text": ref_text,
+    }
+    try:
+        result = await run_worker(state.supervisor, model, payload)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"试听合成失败：{exc}") from exc
+    await asyncio.to_thread(state.cache.put, cache_key, "wav", result.wav)
+    return Response(content=result.wav, media_type="audio/wav", headers={"X-Cache": "MISS"})
 
 
 @app.post("/v1/tts")

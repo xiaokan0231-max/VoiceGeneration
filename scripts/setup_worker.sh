@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 
 MODEL="${1:-}"
 if [[ -z "${MODEL}" ]]; then
-  echo "用法: bash scripts/setup_worker.sh <cosyvoice3|f5_tts>"; exit 1
+  echo "用法: bash scripts/setup_worker.sh <cosyvoice3|f5_tts|style_bert_vits2>"; exit 1
 fi
 
 case "${MODEL}" in
@@ -48,6 +48,16 @@ case "${MODEL}" in
     echo ">> 安装 F5-TTS"
     conda run -n "${ENV}" pip install -r workers/f5_tts/requirements.txt
     echo ">> 权重将在首次合成时自动下载"
+    ;;
+
+  style_bert_vits2)
+    ENV=vg-sbv2; PY=3.10
+    if ! conda env list | grep -qE "^${ENV}\s"; then
+      conda create -y -n "${ENV}" "python=${PY}"
+    fi
+    echo ">> 安装 Style-Bert-VITS2（含 torch / transformers / pyopenjtalk-plus）"
+    conda run -n "${ENV}" pip install -r workers/style_bert_vits2/requirements.txt
+    echo ">> 下一步: bash scripts/download_weights.sh style_bert_vits2"
     ;;
 
   *)

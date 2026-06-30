@@ -170,8 +170,20 @@ def delete_generation(row_id: str) -> bool:
         row = db.get(GenerationHistory, row_id)
         if not row:
             return False
+        path = audio_file(row)          # 解析磁盘文件（不存在/越界则为 None）
+        audio_path = row.audio_path
         db.delete(row)
         db.commit()
+        # 同时删除磁盘上的音频文件；但缓存按内容去重，多条历史可能指向同一文件，
+        # 只有在没有其它记录再引用它时才真正删除，避免误删仍在用的缓存。
+        if path is not None and audio_path:
+            still_referenced = db.scalar(
+                select(func.count())
+                .select_from(GenerationHistory)
+                .where(GenerationHistory.audio_path == audio_path)
+            )
+            if not still_referenced:
+                path.unlink(missing_ok=True)
         return True
 
 

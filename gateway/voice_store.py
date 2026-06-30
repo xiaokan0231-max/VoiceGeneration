@@ -51,6 +51,36 @@ def _duration(path: Path) -> float:
     return float(proc.stdout.strip())
 
 
+# 克隆时模型（CosyVoice/F5）会连同响度一并复制：录得过轻的参考会产出又轻又糊的
+# 克隆音频——上游的 load_wav 不做任何电平归一化。这里把参考统一峰值归一化到该
+# 目标电平，仅改增益、不压缩动态、不剪裁波形，对 F5 末尾留白无影响。
+_TARGET_PEAK_DBFS = -1.0
+
+
+def _peak_normalize(path: Path) -> None:
+    detect = subprocess.run(
+        [media_binary("ffmpeg"), "-hide_banner", "-nostats", "-i", str(path),
+         "-af", "volumedetect", "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    match = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?) dB", detect.stderr)
+    if not match:
+        return  # 测不到电平就保持原样，不阻断上传
+    gain = _TARGET_PEAK_DBFS - float(match.group(1))
+    if abs(gain) < 0.5:
+        return  # 已接近目标电平，无需处理
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = Path(directory) / "norm.wav"
+        proc = subprocess.run(
+            [media_binary("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y", "-i", str(path),
+             "-af", f"volume={gain:.2f}dB", "-ar", "16000", "-ac", "1",
+             "-c:a", "pcm_s16le", str(tmp)],
+            capture_output=True,
+        )
+        if proc.returncode == 0:
+            shutil.move(str(tmp), str(path))
+
+
 def _normalize_audio(data: bytes, destination: Path) -> float:
     if not data or len(data) > MAX_UPLOAD_BYTES:
         raise ValueError("参考音频必须小于 20MB")
@@ -72,6 +102,7 @@ def _normalize_audio(data: bytes, destination: Path) -> float:
     if not 3 <= seconds <= 30:
         destination.unlink(missing_ok=True)
         raise ValueError("参考音频时长需在 3–30 秒之间")
+    _peak_normalize(destination)
     return seconds
 
 

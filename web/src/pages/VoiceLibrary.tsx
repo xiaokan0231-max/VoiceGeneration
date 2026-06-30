@@ -1,12 +1,52 @@
 import { useEffect, useRef, useState } from 'react'
-import { FileAudio, Mic, Plus, Save, Square, Trash2, Upload } from 'lucide-react'
+import { FileAudio, LoaderCircle, Mic, Play, Plus, Save, Square, Trash2, Upload } from 'lucide-react'
 import { api } from '../api'
 import AudioPlayer from '../components/AudioPlayer'
 import { ConfirmDialog, Dialog, useToast } from '../components/Feedback'
-import type { VoiceDetail } from '../types'
+import type { ModelInfo, VoiceDetail, VoiceInfo } from '../types'
 
 interface FormState { id: string; existing: boolean; name: string; language: string; refText: string; models: string[]; file?: File }
 const blank: FormState = { id: '', existing: false, name: '', language: 'zh', refText: '', models: ['cosyvoice3', 'f5_tts'] }
+
+const MODEL_LABELS: Record<string, string> = {
+  cosyvoice3: 'CosyVoice 3', style_bert_vits2: 'Style-Bert-VITS2', f5_tts: 'F5-TTS', system: '系统音色',
+}
+const modelLabel = (id: string) => MODEL_LABELS[id] || id
+
+// 同一时刻只允许一个试听在播放
+let currentPreview: HTMLAudioElement | null = null
+
+function PreviewButton({ model, voice }: { model: string; voice: string }) {
+  const [phase, setPhase] = useState<'idle' | 'loading' | 'playing'>('idle')
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+  const urlRef = useRef('')
+  const clean = () => { if (urlRef.current) { URL.revokeObjectURL(urlRef.current); urlRef.current = '' } }
+  useEffect(() => () => { audioRef.current?.pause(); clean() }, [])
+
+  const onClick = async () => {
+    if (phase === 'playing') { audioRef.current?.pause(); return }
+    if (phase === 'loading') return
+    setPhase('loading')
+    try {
+      const res = await fetch(`/v1/voices/${encodeURIComponent(model)}/${encodeURIComponent(voice)}/preview`)
+      if (!res.ok) throw new Error('preview failed')
+      const blob = await res.blob()
+      currentPreview?.pause()
+      const url = URL.createObjectURL(blob); urlRef.current = url
+      const a = new Audio(url); audioRef.current = a; currentPreview = a
+      a.onended = () => { setPhase('idle'); clean() }
+      a.onpause = () => setPhase(p => (p === 'playing' ? 'idle' : p))
+      await a.play()
+      setPhase('playing')
+    } catch { setPhase('idle') }
+  }
+
+  return <button className="preview-play" onClick={onClick} disabled={phase === 'loading'}
+    aria-label={phase === 'playing' ? '停止试听' : '试听'}>
+    {phase === 'loading' ? <LoaderCircle className="spin" /> : phase === 'playing' ? <Square /> : <Play />}
+    <span>{phase === 'loading' ? '合成中…' : phase === 'playing' ? '停止' : '试听'}</span>
+  </button>
+}
 
 export default function VoiceLibrary() {
   const [voices, setVoices] = useState<VoiceDetail[]>([])
@@ -21,8 +61,19 @@ export default function VoiceLibrary() {
   const chunks = useRef<Blob[]>([])
   const { notify } = useToast()
 
+  const [groups, setGroups] = useState<{ model: ModelInfo; voices: VoiceInfo[] }[]>([])
   const load = () => api.voiceLibrary().then(setVoices).catch(e => setError(e.message))
+  const loadPreviews = async () => {
+    try {
+      const models = await api.models()
+      const entries = await Promise.all(
+        models.map(async model => ({ model, voices: await api.voices(model.id).catch(() => [] as VoiceInfo[]) })),
+      )
+      setGroups(entries.filter(entry => entry.voices.length))
+    } catch { /* 列不出试听不阻断页面 */ }
+  }
   useEffect(() => { void load() }, [])
+  useEffect(() => { void loadPreviews() }, [])
   const edit = (voice: VoiceDetail) => setEditing({ id: voice.id, existing: true, name: voice.name, language: voice.language, refText: voice.ref_text, models: voice.models })
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) => setEditing(f => f ? ({ ...f, [key]: value }) : f)
 
@@ -57,14 +108,14 @@ export default function VoiceLibrary() {
     form.set('name', editing.name); form.set('language', editing.language); form.set('ref_text', editing.refText); form.set('models', JSON.stringify(editing.models))
     if (!editing.existing && editing.id) form.set('voice_id', editing.id)
     if (editing.file) form.set('audio', editing.file)
-    try { await api.saveVoice(form, editing.existing ? editing.id : undefined); setEditing(null); await load(); notify('音色已保存', 'success') }
+    try { await api.saveVoice(form, editing.existing ? editing.id : undefined); setEditing(null); await load(); void loadPreviews(); notify('音色已保存', 'success') }
     catch (e) { setError(e instanceof Error ? e.message : '保存失败') }
     finally { setSaving(false) }
   }
   const remove = async () => {
     if (!deleting) return
     setDeleteBusy(true)
-    try { await api.deleteVoice(deleting.id); setDeleting(null); await load(); notify('音色已删除', 'success') }
+    try { await api.deleteVoice(deleting.id); setDeleting(null); await load(); void loadPreviews(); notify('音色已删除', 'success') }
     catch (e) { setError(e instanceof Error ? e.message : '删除失败') }
     finally { setDeleteBusy(false) }
   }
@@ -87,6 +138,22 @@ export default function VoiceLibrary() {
       </article>)}
       {voices.length === 0 && <div className="empty-state"><FileAudio /><h3>还没有克隆音色</h3><p>上传一段清晰参考录音，即可开始使用 CosyVoice 3 音色克隆。</p></div>}
     </div>
+
+    {groups.length > 0 && <section className="model-preview">
+      <div className="page-heading"><div><span className="eyebrow">PREVIEW</span><h2>各模型测试声音</h2></div></div>
+      <p className="model-preview-hint">点击试听，听听每个模型 / 音色的效果。首次试听会即时合成，请稍候几秒。</p>
+      {groups.map(group => <div className="model-preview-group" key={group.model.id}>
+        <h3>{modelLabel(group.model.id)}<small>{group.model.loaded ? '已加载' : '按需加载'}</small></h3>
+        <div className="preview-chips">
+          {group.voices.map(voice => <div className="preview-chip" key={voice.id}>
+            <PreviewButton model={group.model.id} voice={voice.id} />
+            <span className="preview-name">{voice.name}</span>
+            {voice.language && <span className="preview-lang">{voice.language.toUpperCase()}</span>}
+          </div>)}
+        </div>
+      </div>)}
+    </section>}
+
     <Dialog open={Boolean(editing)} title={editing?.existing ? '编辑音色' : '新建音色'} eyebrow="VOICE PROFILE" onClose={closeEditor} footer={<><button className="quiet-button" disabled={saving} onClick={closeEditor}>取消</button><button className="primary-small" disabled={saving} onClick={save}><Save />{saving ? '保存中…' : '保存音色'}</button></>}>
       {editing && <>
         <div className="field-row"><div className="field"><label htmlFor="voice-name">音色名称</label><input id="voice-name" data-autofocus value={editing.name} onChange={e => set('name', e.target.value)} placeholder="例如：沉稳男声" /></div><div className="field"><label htmlFor="voice-language">语言</label><select id="voice-language" value={editing.language} onChange={e => set('language', e.target.value)}><option value="zh">中文</option><option value="ja">日语</option><option value="en">英语</option></select></div></div>

@@ -1,0 +1,10 @@
+# worker 通用“胶水”依赖（worker_runtime.server 需要）
+fastapi>=0.110
+uvicorn[standard]>=0.29
+# Style-Bert-VITS2 推理库（纯推理，不含训练）。会自动拉入 torch / transformers /
+# pyopenjtalk 等依赖；JP DeBERTa 与 JVNV 模型权重由 download_weights.sh 获取。
+style-bert-vits2
+huggingface_hub
+# pyopenjtalk/pyworld 的预编译 C 扩展按 numpy 1.x ABI 构建，numpy 2.x 会触发
+# "numpy.dtype size changed" 导入错误，因此锁定 <2。
+numpy<2

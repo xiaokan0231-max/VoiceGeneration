@@ -181,3 +181,20 @@ input:not([type="checkbox"]):not([type="range"]), select, textarea { min-height:
   .history-main p { white-space: normal; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden }
   .history-page { overflow: hidden }
 }
+
+/* 音色库 · 各模型测试声音试听 */
+.model-preview { margin-top: 42px; border-top: 1px solid var(--line); padding-top: 22px }
+.model-preview .page-heading { padding-bottom: 6px }
+.model-preview .page-heading h2 { color: var(--text); font-size: 20px; margin: 4px 0 0 }
+.model-preview-hint { color: #8d989d; font-size: 12px; margin: 0 0 20px }
+.model-preview-group { margin-bottom: 22px }
+.model-preview-group h3 { color: var(--text); font-size: 14px; margin: 0 0 11px; display: flex; align-items: baseline; gap: 9px }
+.model-preview-group h3 small { color: #59646a; font-size: 10px; font-weight: 400 }
+.preview-chips { display: flex; flex-wrap: wrap; gap: 10px }
+.preview-chip { display: flex; align-items: center; gap: 9px; border: 1px solid var(--line); background: #1a1410; padding: 7px 13px 7px 7px }
+.preview-name { color: #cdd4d7; font-size: 12px }
+.preview-lang { color: #6a757b; font-size: 9px; border: 1px solid #3a4248; padding: 1px 5px; letter-spacing: .5px }
+.preview-play { display: flex; align-items: center; gap: 6px; border: 1px solid #5d3e29; background: #221913; color: #e19b66; cursor: pointer; padding: 6px 11px; font-size: 11px; font-weight: 600 }
+.preview-play:hover:not(:disabled) { background: #2c2017 }
+.preview-play:disabled { opacity: .6; cursor: default }
+.preview-play svg { width: 14px; height: 14px }

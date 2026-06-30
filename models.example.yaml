@@ -69,3 +69,22 @@ models:
   options:
     model: F5TTS_v1_Base
     device: auto               # Windows: cuda
+- id: style_bert_vits2
+  enabled: false               # 装好环境+权重后改 true（或在副节点网页控制台开启）
+  description: Style-Bert-VITS2 JP-Extra 日语高自然度 TTS（内置音色，非克隆）
+  python: ''                   # 必填：改成本机 vg-sbv2 的解释器，如 /Users/.../envs/vg-sbv2/bin/python
+  backend: workers.style_bert_vits2.backend:StyleBertVITS2Backend
+  host: 127.0.0.1
+  port: 8130                   # 与其它模型端口留出间隔
+  replicas: 1
+  languages: [ja]              # JP-Extra 仅支持日语
+  supports_cloning: false
+  options:
+    model_dir: models/style_bert_vits2
+    device: cpu                # Mac 建议 cpu(VITS 很快)；Windows/NVIDIA 可用 cuda
+    # 内置音色清单：全集群保持一致（各节点用同一模板 + 同样 download_weights）
+    voices:
+    - { id: sbv2_jvnv_f1, name: JVNV-F1（女声・日本語）, language: ja, dir: jvnv-F1-jp }
+    - { id: sbv2_jvnv_f2, name: JVNV-F2（女声・日本語）, language: ja, dir: jvnv-F2-jp }
+    - { id: sbv2_jvnv_m1, name: JVNV-M1（男声・日本語）, language: ja, dir: jvnv-M1-jp }
+    - { id: sbv2_jvnv_m2, name: JVNV-M2（男声・日本語）, language: ja, dir: jvnv-M2-jp }
