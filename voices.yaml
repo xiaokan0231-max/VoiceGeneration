@@ -31,3 +31,11 @@ voices:
   models:
   - cosyvoice3
   - f5_tts
+- id: voice_5a4127fb
+  name: 桂
+  language: ja
+  ref_audio: voices/voice_5a4127fb/ref.wav
+  ref_text: おお。しばらくぶりではないか。ゆっくり休むがいい。俺はここらで失礼するとしよう。では。またな。かたじけない。気にする事はないぞ，すまんな
+  models:
+  - cosyvoice3
+  - f5_tts
