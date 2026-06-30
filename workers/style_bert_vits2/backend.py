@@ -14,7 +14,9 @@
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 from pathlib import Path
 
 # 个别 torch 算子在 MPS 上尚未实现时自动回退 CPU（必须在首次导入 torch 前设置）。
@@ -29,11 +31,23 @@ _BERT_NAMES = {
     "zh": "hfl/chinese-roberta-wwm-ext-large",
 }
 
+# 把「风格指令」里的中/日/英情绪词映射到 JVNV 训练好的情感风格名。
+_STYLE_KEYWORDS = {
+    "Sad": ["sad", "sorrow", "悲", "哀", "难过", "伤感", "沉重", "かなし", "悲し", "つら"],
+    "Angry": ["angry", "anger", "怒", "愤", "气愤", "おこ", "いか", "怒り"],
+    "Happy": ["happy", "joy", "喜", "开心", "高兴", "快乐", "愉悦", "楽し", "うれし", "幸せ"],
+    "Fear": ["fear", "scared", "恐", "害怕", "惧", "怖", "こわ", "不安"],
+    "Disgust": ["disgust", "厌恶", "嫌", "反感", "嫌悪"],
+    "Surprise": ["surprise", "惊", "驚", "意外", "びっくり", "驚き"],
+    "Neutral": ["neutral", "中性", "平静", "平淡", "普通", "冷静"],
+}
+
 
 class StyleBertVITS2Backend(TTSBackend):
     def __init__(self, model_id, options):
         super().__init__(model_id, options)
         self._models: dict[str, object] = {}   # voice_id -> TTSModel（按需惰性加载并缓存）
+        self._styles: dict[str, dict] = {}      # voice_id -> {风格名: id}（从 config.json 读）
         self._bert_loaded: set = set()          # 已加载 BERT 的语言枚举
         self._device: str | None = None
         self._voices = list(self.options.get("voices") or [])
@@ -103,14 +117,39 @@ class StyleBertVITS2Backend(TTSBackend):
         folder = (self._root / voice.get("dir", vid)).resolve()
         if not folder.is_dir():
             raise FileNotFoundError(f"音色目录不存在: {folder}")
+        config_path = folder / "config.json"
         model = TTSModel(
             model_path=self._find(folder, "*.safetensors"),
-            config_path=folder / "config.json",
+            config_path=config_path,
             style_vec_path=folder / "style_vectors.npy",
             device=self._resolve_device(),
         )
         self._models[vid] = model
+        try:
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            self._styles[vid] = dict((cfg.get("data") or {}).get("style2id") or {})
+        except Exception:
+            self._styles[vid] = {}
         return model
+
+    def _resolve_style(self, hint, styles: dict) -> tuple[str | None, float | None]:
+        """把「风格指令」文字解析成 (风格名, 强度)。支持英文风格名 / 中日英情绪词 /
+        末尾 ':8' 指定强度（越大情感越强）。无法识别则用 Neutral。"""
+        names = {s.lower(): s for s in styles}
+        default = "Neutral" if "Neutral" in styles else next(iter(styles), None)
+        if not hint or not str(hint).strip():
+            return default, None
+        text, weight = str(hint).strip(), None
+        match = re.match(r"^\s*(.+?)\s*[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*$", text)
+        if match:
+            text, weight = match.group(1).strip(), float(match.group(2))
+        low = text.lower()
+        if low in names:
+            return names[low], weight
+        for canon, words in _STYLE_KEYWORDS.items():
+            if canon in styles and any(word in low for word in words):
+                return canon, weight
+        return default, weight
 
     def synthesize(self, req: SynthRequest) -> bytes:
         if req.mode != "clone":
@@ -127,8 +166,13 @@ class StyleBertVITS2Backend(TTSBackend):
             "language": self._lang_enum(lang_code),
             "length": 1.0 / max(0.1, req.speed or 1.0),   # length 越大语速越慢
         }
-        if voice.get("style"):
-            kwargs["style"] = voice["style"]
+        # 情感风格：优先用本次「风格指令」(instruct_text)，其次音色默认 style。
+        style, weight = self._resolve_style(
+            req.instruct_text or voice.get("style"), self._styles.get(voice["id"], {}))
+        if style:
+            kwargs["style"] = style
+        if weight is not None:
+            kwargs["style_weight"] = weight
         if voice.get("speaker_id") is not None:
             kwargs["speaker_id"] = int(voice["speaker_id"])
         sr, audio = model.infer(**kwargs)

@@ -37,6 +37,7 @@ export default function Workbench({ projects, onProjectsChange }: { projects: Pr
   const selectedVoice = useMemo(() => voices.find(voice => voice.id === draft.voice), [voices, draft.voice])
   const update = <K extends keyof typeof draft>(key: K, value: typeof draft[K]) => setDraft(current => ({ ...current, [key]: value }))
   const canGenerate = Boolean(draft.text.trim() && draft.voice && (draft.mode !== 'instruct' || draft.instruct_text.trim()))
+  const isSbv2 = draft.model === 'style_bert_vits2'
 
   const copyText = async (id: string, text: string) => {
     try {
@@ -98,7 +99,7 @@ export default function Workbench({ projects, onProjectsChange }: { projects: Pr
       <div className="field"><label>生成模式</label><div className="segmented three">{(['clone', 'instruct', 'cross_lingual'] as GenerationMode[]).map(mode => <button key={mode} disabled={draft.model !== 'cosyvoice3' && mode !== 'clone'} className={draft.mode === mode ? 'active' : ''} onClick={() => update('mode', mode)}>{mode === 'clone' ? '克隆' : mode === 'instruct' ? '指令' : '跨语言'}</button>)}</div></div>
       <div className="field-row"><div className="field"><label>语言</label><select value={draft.language} onChange={event => update('language', event.target.value)}><option value="zh">中文</option><option value="ja">日语</option><option value="en">英语</option><option value="auto">自动识别</option></select></div><div className="field"><label>格式</label><select value={draft.format} onChange={event => update('format', event.target.value)}><option value="wav">WAV</option><option value="mp3">MP3</option><option value="opus">OPUS</option></select></div></div>
       <div className="field"><div className="range-label"><label>语速</label><output>{draft.speed.toFixed(1)}×</output></div><input type="range" min="0.5" max="2" step="0.1" value={draft.speed} onChange={event => update('speed', Number(event.target.value))} /></div>
-      <div className="field"><label>{draft.mode === 'instruct' ? '风格指令（必填）' : '风格指令'}</label><textarea className="instruction" value={draft.instruct_text} onChange={event => update('instruct_text', event.target.value)} placeholder="例如：沉稳、克制、有纪录片质感" /><small>{draft.mode === 'instruct' ? 'CosyVoice 3 会按此指令控制语气' : '克隆与跨语言模式保留备用'}</small></div>
+      <div className="field"><label>{isSbv2 ? '情感风格' : draft.mode === 'instruct' ? '风格指令（必填）' : '风格指令'}</label><textarea className="instruction" value={draft.instruct_text} onChange={event => update('instruct_text', event.target.value)} placeholder={isSbv2 ? '如 Sad / 悲伤 / 怒り，可加强度：Sad:8' : '例如：沉稳、克制、有纪录片质感'} /><small>{isSbv2 ? 'Style-Bert-VITS2：从 Neutral / Happy / Sad / Angry / Fear / Disgust / Surprise 选一种（也认中/日文情绪词），留空＝Neutral' : draft.mode === 'instruct' ? 'CosyVoice 3 会按此指令控制语气' : '克隆与跨语言模式保留备用'}</small></div>
       {error && <div className="inline-error" role="alert">{error}</div>}
       <button className="generate-button" disabled={submitting || !canGenerate} onClick={generate}>{submitting ? <LoaderCircle className="spin" /> : <Sparkles />}{submitting ? '正在提交任务…' : '生成语音'}</button>
       <p className="privacy-note">音频与文字仅在这台 Mac 上处理</p>
