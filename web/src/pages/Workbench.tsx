@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
-import { Check, ChevronDown, Copy, Download, LoaderCircle, RefreshCw, RotateCcw, Save, SlidersHorizontal, Sparkles, X } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { Check, ChevronDown, Copy, Download, LoaderCircle, Pause, Play, RefreshCw, RotateCcw, Save, SlidersHorizontal, Sparkles, X } from 'lucide-react'
 import { api } from '../api'
 import AudioPlayer from '../components/AudioPlayer'
 import { ConfirmDialog, Dialog, useToast } from '../components/Feedback'
@@ -7,12 +7,16 @@ import { useGeneration } from '../context/GenerationContext'
 import type { GenerationMode, HistoryItem, ModelInfo, ProjectDetail, VoiceInfo } from '../types'
 
 const modeLabels: Record<GenerationMode, string> = { clone: '音色克隆', instruct: '指令控制', cross_lingual: '跨语言克隆' }
+const langLabels: Record<string, string> = { zh: '中文', ja: '日语', en: '英语', auto: '自动识别' }
+const RECENT_PAGE_SIZE = 5
 
 export default function Workbench({ projects, onProjectsChange }: { projects: ProjectDetail[]; onProjectsChange: () => void }) {
-  const { draft, setDraft, resetDraft, savedAt, tasks, latestTask, historyVersion, startGeneration } = useGeneration()
+  const { draft, setDraft, replaceDraft, resetDraft, savedAt, tasks, latestTask, historyVersion, startGeneration } = useGeneration()
   const [models, setModels] = useState<ModelInfo[]>([])
   const [voices, setVoices] = useState<VoiceInfo[]>([])
   const [recent, setRecent] = useState<HistoryItem[]>([])
+  const [recentPage, setRecentPage] = useState(1)
+  const [recentTotal, setRecentTotal] = useState(0)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
   const [currentTaskId, setCurrentTaskId] = useState('')
@@ -22,6 +26,8 @@ export default function Workbench({ projects, onProjectsChange }: { projects: Pr
   const [newProjectName, setNewProjectName] = useState('')
   const [savingProject, setSavingProject] = useState(false)
   const [resetOpen, setResetOpen] = useState(false)
+  const [playingId, setPlayingId] = useState('')
+  const recentAudio = useRef<HTMLAudioElement>(null)
   const { notify } = useToast()
 
   useEffect(() => { api.models().then(setModels).catch(value => setError(value.message)) }, [])
@@ -31,7 +37,12 @@ export default function Workbench({ projects, onProjectsChange }: { projects: Pr
       if (list.length && !list.some(voice => voice.id === draft.voice)) setDraft(value => ({ ...value, voice: list[0].id }))
     }).catch(value => setError(value.message))
   }, [draft.model, draft.voice, setDraft])
-  useEffect(() => { api.history('page_size=4').then(result => setRecent(result.items)).catch(() => setRecent([])) }, [historyVersion])
+  useEffect(() => { setRecentPage(1) }, [historyVersion])
+  useEffect(() => {
+    api.history(`page=${recentPage}&page_size=${RECENT_PAGE_SIZE}`)
+      .then(result => { setRecent(result.items); setRecentTotal(result.total) })
+      .catch(() => { setRecent([]); setRecentTotal(0) })
+  }, [historyVersion, recentPage])
 
   const currentTask = useMemo(() => tasks.find(task => task.id === currentTaskId) || latestTask, [tasks, currentTaskId, latestTask])
   const selectedVoice = useMemo(() => voices.find(voice => voice.id === draft.voice), [voices, draft.voice])
@@ -44,6 +55,21 @@ export default function Workbench({ projects, onProjectsChange }: { projects: Pr
       await navigator.clipboard.writeText(text); setCopiedId(id)
       window.setTimeout(() => setCopiedId(current => current === id ? '' : current), 1500)
     } catch { notify('复制失败，请手动选择文本复制', 'error') }
+  }
+  const togglePlay = (id: string) => {
+    const element = recentAudio.current
+    if (!element) return
+    if (playingId === id) { element.pause(); setPlayingId(''); return }
+    element.src = `/v1/history/${id}/audio`
+    void element.play().then(() => setPlayingId(id)).catch(() => { setPlayingId(''); notify('音频播放失败', 'error') })
+  }
+  const loadDraft = (item: HistoryItem) => {
+    replaceDraft({
+      text: item.text, model: item.model, voice: item.voice, mode: item.mode, language: item.language,
+      speed: item.speed, format: item.format, instruct_text: item.instruct_text, project_id: item.project_id,
+    })
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+    notify('已载入该记录的参数到工作台', 'success')
   }
   const generate = async () => {
     if (!canGenerate || submitting) return
@@ -80,13 +106,34 @@ export default function Workbench({ projects, onProjectsChange }: { projects: Pr
         </> : currentTask && !['failed', 'cancelled'].includes(currentTask.status) ? <div className="generation-pending"><LoaderCircle className="spin" /><div><strong>{currentTask.status === 'queued' ? '等待可用 Worker' : '正在生成音频'}</strong><p>{currentTask.node_name ? `${currentTask.node_name} 已领取任务，可放心切换页面。` : '任务已进入队列，可放心切换页面。'}</p></div></div> : <div className="empty-audio"><span className="empty-wave">||||||||||||||||||||||||</span><p>{currentTask?.error_message || '生成后的真实音频波形会显示在这里'}</p></div>}
       </section>
       <section className="recent-block">
-        <div className="section-line"><label>最近生成</label><span>保存在本机 MySQL</span></div>
-        {recent.length === 0 ? <p className="muted">还没有生成记录</p> : recent.map(item => <div className="recent-row" key={item.id}>
-          <span className={`history-status ${item.status}`} />
-          <div><p>{item.text}</p><small>{item.voice_name} · {modeLabels[item.mode]} · {new Date(item.created_at).toLocaleString('zh-CN', { hour12: false })}</small></div>
+        <div className="section-line"><label>最近生成</label><span>{recentTotal > 0 ? `共 ${recentTotal} 条 · ` : ''}保存在本机 MySQL</span></div>
+        <audio ref={recentAudio} className="recent-audio" preload="none" onEnded={() => setPlayingId('')} onError={() => setPlayingId('')} />
+        {recent.length === 0 ? <p className="muted">还没有生成记录</p> : recent.map(item => <div className="recent-row" key={item.id} role="button" tabIndex={0} title="点击载入该记录的参数到工作台" onClick={() => loadDraft(item)} onKeyDown={event => { if (event.target === event.currentTarget && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); loadDraft(item) } }}>
+          <span className={`recent-accent ${item.status}`} />
+          <div className="recent-body">
+            <p>{item.text}</p>
+            <div className="meta-tags">
+              <span className={`tag mode-${item.mode}`}>{modeLabels[item.mode]}</span>
+              {item.instruct_text?.trim() && <span className="tag tag-style" title={item.instruct_text}><Sparkles />{item.instruct_text}</span>}
+              <span className="tag">{item.model}</span>
+              <span className="tag">{item.voice_name}</span>
+              <span className="tag">{langLabels[item.language] || item.language}</span>
+              <span className="tag">{item.speed.toFixed(1)}×</span>
+              <span className="tag">{item.format.toUpperCase()}</span>
+              {item.project_name && <span className="tag">{item.project_name}</span>}
+              {item.cache_hit && <span className="tag tag-cache">缓存命中</span>}
+              <span className="tag-time">{new Date(item.created_at).toLocaleString('zh-CN', { hour12: false })}</span>
+            </div>
+          </div>
           <span className="recent-duration">{item.duration_seconds ? `${item.duration_seconds.toFixed(1)}s` : item.status === 'failed' ? '失败' : item.status === 'cancelled' ? '已取消' : '处理中'}</span>
-          <button className={`recent-copy ${copiedId === item.id ? 'copied' : ''}`} aria-label="复制文本" onClick={() => copyText(item.id, item.text)}>{copiedId === item.id ? <Check /> : <Copy />}</button>
+          <button className={`recent-play ${playingId === item.id ? 'playing' : ''}`} aria-label={playingId === item.id ? '暂停' : '播放'} disabled={!item.audio_available} onClick={event => { event.stopPropagation(); togglePlay(item.id) }}>{playingId === item.id ? <Pause /> : <Play />}</button>
+          <button className={`recent-copy ${copiedId === item.id ? 'copied' : ''}`} aria-label="复制文本" onClick={event => { event.stopPropagation(); copyText(item.id, item.text) }}>{copiedId === item.id ? <Check /> : <Copy />}</button>
         </div>)}
+        {recentTotal > RECENT_PAGE_SIZE && <div className="pagination recent-pagination">
+          <button disabled={recentPage <= 1} onClick={() => setRecentPage(value => Math.max(1, value - 1))}>上一页</button>
+          <span>{recentPage} / {Math.ceil(recentTotal / RECENT_PAGE_SIZE)}</span>
+          <button disabled={recentPage >= Math.ceil(recentTotal / RECENT_PAGE_SIZE)} onClick={() => setRecentPage(value => value + 1)}>下一页</button>
+        </div>}
       </section>
     </section>
     <button className="mobile-parameter-button" onClick={() => setParametersOpen(true)}><SlidersHorizontal />生成参数</button>
@@ -99,7 +146,7 @@ export default function Workbench({ projects, onProjectsChange }: { projects: Pr
       <div className="field"><label>生成模式</label><div className="segmented three">{(['clone', 'instruct', 'cross_lingual'] as GenerationMode[]).map(mode => <button key={mode} disabled={draft.model !== 'cosyvoice3' && mode !== 'clone'} className={draft.mode === mode ? 'active' : ''} onClick={() => update('mode', mode)}>{mode === 'clone' ? '克隆' : mode === 'instruct' ? '指令' : '跨语言'}</button>)}</div></div>
       <div className="field-row"><div className="field"><label>语言</label><select value={draft.language} onChange={event => update('language', event.target.value)}><option value="zh">中文</option><option value="ja">日语</option><option value="en">英语</option><option value="auto">自动识别</option></select></div><div className="field"><label>格式</label><select value={draft.format} onChange={event => update('format', event.target.value)}><option value="wav">WAV</option><option value="mp3">MP3</option><option value="opus">OPUS</option></select></div></div>
       <div className="field"><div className="range-label"><label>语速</label><output>{draft.speed.toFixed(1)}×</output></div><input type="range" min="0.5" max="2" step="0.1" value={draft.speed} onChange={event => update('speed', Number(event.target.value))} /></div>
-      <div className="field"><label>{isSbv2 ? '情感风格' : draft.mode === 'instruct' ? '风格指令（必填）' : '风格指令'}</label><textarea className="instruction" value={draft.instruct_text} onChange={event => update('instruct_text', event.target.value)} placeholder={isSbv2 ? '如 Sad / 悲伤 / 怒り，可加强度：Sad:8' : '例如：沉稳、克制、有纪录片质感'} /><small>{isSbv2 ? 'Style-Bert-VITS2：从 Neutral / Happy / Sad / Angry / Fear / Disgust / Surprise 选一种（也认中/日文情绪词），留空＝Neutral' : draft.mode === 'instruct' ? 'CosyVoice 3 会按此指令控制语气' : '克隆与跨语言模式保留备用'}</small></div>
+      <div className="field"><label>{isSbv2 ? '情感风格' : draft.mode === 'instruct' ? '风格指令（必填）' : '风格指令'}</label><textarea className="instruction" value={draft.instruct_text} onChange={event => update('instruct_text', event.target.value)} placeholder={isSbv2 ? '如 Happy / Sad / 怒り；强度默认已加强，写 Happy:10 更强、Happy:3 更弱' : '例如：沉稳、克制、有纪录片质感'} /><small>{isSbv2 ? 'Style-Bert-VITS2：从 Neutral / Happy / Sad / Angry / Fear / Disgust / Surprise 选一种（也认中/日文情绪词），留空＝Neutral。情绪默认强度已调高，可用 “情绪:数字” 微调（如 Happy:10）' : draft.mode === 'instruct' ? 'CosyVoice 3 会按此指令控制语气' : '克隆与跨语言模式保留备用'}</small></div>
       {error && <div className="inline-error" role="alert">{error}</div>}
       <button className="generate-button" disabled={submitting || !canGenerate} onClick={generate}>{submitting ? <LoaderCircle className="spin" /> : <Sparkles />}{submitting ? '正在提交任务…' : '生成语音'}</button>
       <p className="privacy-note">音频与文字仅在这台 Mac 上处理</p>

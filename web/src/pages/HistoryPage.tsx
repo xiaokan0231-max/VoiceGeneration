@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Download, History, LoaderCircle, RefreshCw, Search, Trash2, X } from 'lucide-react'
+import { Download, History, LoaderCircle, RefreshCw, Search, Sparkles, Trash2, X } from 'lucide-react'
 import { useSearchParams } from 'react-router-dom'
 import { api } from '../api'
 import AudioPlayer from '../components/AudioPlayer'
 import { ConfirmDialog, useToast } from '../components/Feedback'
-import type { GenerationDraft, HistoryItem, ModelInfo, ProjectDetail } from '../types'
+import type { GenerationDraft, GenerationMode, HistoryItem, ModelInfo, ProjectDetail } from '../types'
 
 const statusLabel: Record<HistoryItem['status'], string> = {
   completed: '已完成', running: '生成中', leased: '生成中', queued: '排队中', failed: '失败', cancelled: '已取消',
 }
+const modeLabels: Record<GenerationMode, string> = { clone: '音色克隆', instruct: '指令控制', cross_lingual: '跨语言克隆' }
 
 export default function HistoryPage({ version, projects, onReuse }: { version: number; projects: ProjectDetail[]; onReuse: (draft: GenerationDraft) => void }) {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -109,7 +110,7 @@ export default function HistoryPage({ version, projects, onReuse }: { version: n
     {!loading && !error && items.length === 0 && <div className="empty-state"><History /><h3>{filtered ? '没有符合条件的记录' : '还没有生成记录'}</h3><p>{filtered ? '尝试清空筛选，或换一个关键词。' : '从生成工作台提交第一条语音任务。'}</p></div>}
     <div className={`history-list ${loading ? 'is-loading' : ''}`} aria-busy={loading}>
       {items.map(item => <article className="history-entry" key={item.id}>
-        <div className="history-main"><div className="history-topline"><span className={`state-label ${item.status}`}>{statusLabel[item.status]}</span><span className="project-badge"><span className="badge-dot" style={{ background: projectColors.get(item.project_id) || '#6d777d' }} />{item.project_name || '未归类'}</span><time>{new Date(item.created_at).toLocaleString('zh-CN', { hour12: false })}</time></div><p>{item.text}</p><small>{item.model} · {item.voice_name} · {item.mode} · {item.speed.toFixed(1)}× · {item.format.toUpperCase()}{item.duration_seconds != null ? ` · 时长 ${item.duration_seconds.toFixed(1)}s` : ''}{item.elapsed_seconds != null ? ` · 耗时 ${item.elapsed_seconds.toFixed(1)}s` : ''}{item.cache_hit ? ' · 缓存命中' : ''}{item.node_name ? ` · 由 ${item.node_name} 生成` : ''}</small>{item.error_message && <div className="entry-error">{item.error_message}</div>}<label className="move-project"><span>{moving === item.id ? '移动中' : '移到'}</span><select disabled={moving === item.id} value={item.project_id || ''} onChange={event => moveToProject(item.id, event.target.value)}><option value="">未归类</option>{projects.map(value => <option key={value.id} value={value.id}>{value.name}</option>)}</select></label></div>
+        <div className="history-main"><div className="history-topline"><span className={`state-label ${item.status}`}>{statusLabel[item.status]}</span><span className="project-badge"><span className="badge-dot" style={{ background: projectColors.get(item.project_id) || '#6d777d' }} />{item.project_name || '未归类'}</span><time>{new Date(item.created_at).toLocaleString('zh-CN', { hour12: false })}</time></div><p>{item.text}</p><div className="meta-tags"><span className={`tag mode-${item.mode}`}>{modeLabels[item.mode]}</span>{item.instruct_text?.trim() && <span className="tag tag-style" title={item.instruct_text}><Sparkles />{item.instruct_text}</span>}<span className="tag">{item.model}</span><span className="tag">{item.voice_name}</span><span className="tag">{item.speed.toFixed(1)}×</span><span className="tag">{item.format.toUpperCase()}</span>{item.duration_seconds != null && <span className="tag">时长 {item.duration_seconds.toFixed(1)}s</span>}{item.elapsed_seconds != null && <span className="tag">耗时 {item.elapsed_seconds.toFixed(1)}s</span>}{item.cache_hit && <span className="tag tag-cache">缓存命中</span>}{item.node_name && <span className="tag">{item.node_name}</span>}</div>{item.error_message && <div className="entry-error">{item.error_message}</div>}<label className="move-project"><span>{moving === item.id ? '移动中' : '移到'}</span><select disabled={moving === item.id} value={item.project_id || ''} onChange={event => moveToProject(item.id, event.target.value)}><option value="">未归类</option>{projects.map(value => <option key={value.id} value={value.id}>{value.name}</option>)}</select></label></div>
         <div className="history-player">{item.audio_available ? <AudioPlayer src={`/v1/history/${item.id}/audio`} compact /> : <span className="audio-missing">{item.status === 'failed' ? '没有音频' : item.status === 'cancelled' ? '任务已取消' : item.status === 'queued' ? '排队中…' : item.status === 'leased' || item.status === 'running' ? '生成中…' : '音频已清理'}</span>}</div>
         <div className="history-actions">{item.audio_available && <a href={`/v1/history/${item.id}/audio`} download aria-label="下载音频"><Download /></a>}<button onClick={() => reuse(item)} aria-label="在工作台复用"><RefreshCw /></button><button onClick={() => setDeleting(item)} aria-label="删除历史记录"><Trash2 /></button></div>
       </article>)}
