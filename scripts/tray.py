@@ -23,10 +23,40 @@ import webbrowser
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-# 让脚本既能 `python scripts/tray.py` 也能在 .app 里运行
-ROOT = Path(__file__).resolve().parent.parent
+
+def _is_repository(path: Path) -> bool:
+    return (path / "scripts" / "tray.py").is_file() and (path / "gateway" / "config.py").is_file()
+
+
+def _repository_root() -> Path:
+    """Locate the persistent checkout when running from a PyInstaller executable."""
+    if not getattr(sys, "frozen", False):
+        return Path(__file__).resolve().parent.parent
+
+    explicit = os.environ.get("VG_REPO_ROOT")
+    candidates = [Path(explicit).expanduser()] if explicit else []
+    for start in (Path(sys.executable).resolve().parent, Path.cwd().resolve()):
+        candidates.extend((start, *start.parents))
+    for candidate in candidates:
+        if _is_repository(candidate):
+            return candidate
+
+    # A normal release lives at <repo>/dist/VoiceGeneration.exe. Keep this
+    # fallback deterministic so a missing checkout produces a useful path in
+    # logs rather than silently using PyInstaller's temporary extraction dir.
+    executable_dir = Path(sys.executable).resolve().parent
+    return executable_dir.parent if executable_dir.name.lower() == "dist" else executable_dir
+
+
+# 让脚本既能 `python scripts/tray.py`、在 .app 里运行，也能从 dist/*.exe 找回仓库。
+ROOT = _repository_root()
+BUNDLE_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
 sys.path.insert(0, str(ROOT))
 
+from gateway import config as gateway_config  # noqa: E402
+
+# PyInstaller 中 gateway.config.__file__ 位于临时解包目录；所有持久配置仍应读写真实仓库。
+gateway_config.ROOT = ROOT
 from gateway.config import load_config, load_raw_models, save_raw_models  # noqa: E402
 
 PKG = ROOT / "packaging"
@@ -96,6 +126,70 @@ def set_autostart(on: bool) -> None:
 
 
 # --------------------------------------------------------------------------- #
+def _gateway_python() -> str:
+    """Return the real vg-gateway interpreter used to launch backend modules."""
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+
+    direct = os.environ.get("VG_GATEWAY_PYTHON")
+    if direct and Path(direct).is_file():
+        return str(Path(direct).resolve())
+
+    conda_executables: list[Path] = []
+    if os.environ.get("CONDA_EXE"):
+        conda_executables.append(Path(os.environ["CONDA_EXE"]))
+    discovered_conda = shutil.which("conda")
+    if discovered_conda:
+        conda_executables.append(Path(discovered_conda))
+
+    home = Path.home()
+    username = os.environ.get("USERNAME", home.name)
+    conda_roots = [
+        home / "miniconda3",
+        home / "anaconda3",
+        Path("D:/Users") / username / "miniconda3",
+        Path("C:/ProgramData/miniconda3"),
+    ]
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        prefix = Path(conda_prefix)
+        if prefix.name.lower() == "vg-gateway":
+            candidate = prefix / "python.exe"
+            if candidate.is_file():
+                return str(candidate.resolve())
+        conda_roots.append(prefix)
+    for conda in conda_executables:
+        if conda.is_file():
+            conda_roots.append(conda.resolve().parent.parent)
+
+    for root in conda_roots:
+        candidate = root / "envs" / "vg-gateway" / "python.exe"
+        if candidate.is_file():
+            return str(candidate.resolve())
+
+    # Custom Conda env directories are not necessarily under <base>/envs.
+    for conda in conda_executables:
+        if not conda.is_file():
+            continue
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            result = subprocess.run(
+                [str(conda), "env", "list", "--json"],
+                capture_output=True, text=True, timeout=15, creationflags=flags,
+            )
+            for env_path in json.loads(result.stdout or "{}").get("envs", []):
+                candidate = Path(env_path)
+                if candidate.name.lower() == "vg-gateway" and (candidate / "python.exe").is_file():
+                    return str((candidate / "python.exe").resolve())
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+            continue
+
+    raise RuntimeError(
+        "找不到 vg-gateway 的 python.exe；请创建该 Conda 环境，"
+        "或设置 VG_GATEWAY_PYTHON 为其 python.exe 的完整路径。"
+    )
+
+
 def _http_json(url: str, token: str = "", timeout: float = 3.0) -> dict:
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     with urlopen(Request(url, headers=headers), timeout=timeout) as r:
@@ -147,6 +241,7 @@ class BackendController:
         self.port = cfg.settings.port
         self.agent_port = cfg.settings.cluster.agent_port
         self.token = cfg.settings.api_token
+        self.backend_python = _gateway_python()
         self.proc: subprocess.Popen | None = None
         self.logfile = None
         self.want = bool(self.role)
@@ -161,9 +256,9 @@ class BackendController:
     # ---- 子进程 -------------------------------------------------------- #
     def _backend_cmd(self, role: str) -> list[str]:
         if role == "coordinator":
-            return [sys.executable, "-m", "uvicorn", "gateway.main:app",
+            return [self.backend_python, "-m", "uvicorn", "gateway.main:app",
                     "--host", self.host, "--port", str(self.port)]
-        return [sys.executable, "-m", "gateway.agent"]
+        return [self.backend_python, "-m", "gateway.agent"]
 
     def _spawn(self, role: str) -> None:
         LOG_DIR.mkdir(exist_ok=True)
@@ -185,7 +280,7 @@ class BackendController:
                     except Exception:  # noqa: BLE001
                         pass
             try:
-                subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"],
+                subprocess.run([self.backend_python, "-m", "alembic", "upgrade", "head"],
                                cwd=str(ROOT), capture_output=True, env=env, timeout=120)
             except Exception:  # noqa: BLE001
                 pass
@@ -402,9 +497,9 @@ def run_mac(ctrl: BackendController) -> None:
 # --------------------------------------------------------------------------- #
 def _load_icon(name: str):
     from PIL import Image
-    path = PKG / name
-    if path.exists():
-        return Image.open(path)
+    for path in (PKG / name, BUNDLE_ROOT / "packaging" / name):
+        if path.exists():
+            return Image.open(path)
     import make_icons
     return make_icons._render(128, with_bg=False,
                               color=make_icons.COPPER if "off" not in name else make_icons.GRAY)
