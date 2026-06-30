@@ -32,9 +32,9 @@ from .config import (
 from . import cluster
 from .agent import EmbeddedAgent, run_worker
 from .database import (
-    audio_file, create_project, db_session, delete_generation, delete_project,
-    finish_generation, get_generation, get_project, history_dict, init_database,
-    list_generations, list_projects, new_generation, project_name_map,
+    active_generations, audio_file, create_project, db_session, delete_generation,
+    delete_project, finish_generation, get_generation, get_project, history_dict,
+    init_database, list_generations, list_projects, new_generation, project_name_map,
     set_generation_project, update_project,
 )
 from .schemas import (
@@ -375,6 +375,15 @@ async def list_voices(
                     kind="builtin", model=model_cfg.id,
                 ))
     return result
+
+
+@app.get("/v1/active-jobs")
+async def active_jobs(request: Request, authorization: str | None = Depends(check_auth)):
+    """全集群当前未完成(排队/生成中)的任务，供右上角任务徽标与抽屉显示。"""
+    state = get_state(request)
+    _require_token(state, authorization)
+    rows, total = await asyncio.to_thread(active_generations, 50)
+    return {"total": total, "items": [_generation_payload(row) for row in rows]}
 
 
 @app.get("/v1/voice-library")

@@ -44,6 +44,7 @@ export const api = {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(draft),
   }),
   generation: (id: string, signal?: AbortSignal) => jsonRequest<GenerationTask>(`/v1/generations/${id}`, { signal }),
+  activeJobs: (signal?: AbortSignal) => jsonRequest<{ total: number; items: GenerationTask[] }>('/v1/active-jobs', { signal }),
   cancelGeneration: (id: string) => jsonRequest<GenerationTask>(`/v1/generations/${id}`, { method: 'DELETE' }),
   deleteHistory: (id: string) => jsonRequest<{ ok: boolean }>(`/v1/history/${id}`, { method: 'DELETE' }),
   saveSettings: (body: Record<string, unknown>) => jsonRequest<SettingsInfo>('/v1/settings', {

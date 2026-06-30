@@ -36,6 +36,8 @@ interface GenerationState {
   savedAt: number | null
   tasks: GenerationTask[]
   activeCount: number
+  liveJobs: GenerationTask[]
+  liveCount: number
   latestTask: GenerationTask | null
   historyVersion: number
   startGeneration: (draft?: GenerationDraft) => Promise<GenerationTask>
@@ -51,8 +53,25 @@ export function GenerationProvider({ children }: { children: ReactNode }) {
   const [tasks, setTasks] = useState<GenerationTask[]>([])
   const tasksRef = useRef<GenerationTask[]>([])
   const [historyVersion, setHistoryVersion] = useState(0)
+  const [liveJobs, setLiveJobs] = useState<GenerationTask[]>([])
+  const [liveCount, setLiveCount] = useState(0)
   const { notify } = useToast()
   useEffect(() => { tasksRef.current = tasks }, [tasks])
+
+  // 轮询全集群当前未完成的任务（任何来源/会话提交的都算），供任务徽标反映真实在跑数。
+  useEffect(() => {
+    let stopped = false
+    let timer = 0
+    const tick = async () => {
+      try {
+        const res = await api.activeJobs()
+        if (!stopped) { setLiveJobs(res.items); setLiveCount(res.total) }
+      } catch { /* 瞬时错误忽略，下一轮重试 */ }
+      if (!stopped) timer = window.setTimeout(tick, document.hidden ? 8000 : 3000)
+    }
+    void tick()
+    return () => { stopped = true; window.clearTimeout(timer) }
+  }, [])
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -138,9 +157,10 @@ export function GenerationProvider({ children }: { children: ReactNode }) {
   const resetDraft = useCallback(() => { localStorage.removeItem(DRAFT_KEY); setDraft(DEFAULT_DRAFT) }, [])
   const value = useMemo<GenerationState>(() => ({
     draft, setDraft, replaceDraft, resetDraft, savedAt, tasks,
-    activeCount: activeIds.length, latestTask: tasks[0] || null, historyVersion,
+    activeCount: activeIds.length, liveJobs, liveCount,
+    latestTask: tasks[0] || null, historyVersion,
     startGeneration, cancelGeneration, retryGeneration,
-  }), [draft, savedAt, tasks, activeIds.length, historyVersion, startGeneration, cancelGeneration, retryGeneration, replaceDraft, resetDraft])
+  }), [draft, savedAt, tasks, activeIds.length, liveJobs, liveCount, historyVersion, startGeneration, cancelGeneration, retryGeneration, replaceDraft, resetDraft])
 
   return <GenerationContext.Provider value={value}>{children}</GenerationContext.Provider>
 }

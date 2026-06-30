@@ -21,6 +21,7 @@ export default function HistoryPage({ version, projects, onReuse }: { version: n
   const [moving, setMoving] = useState('')
   const [deleting, setDeleting] = useState<HistoryItem | null>(null)
   const [deleteBusy, setDeleteBusy] = useState(false)
+  const [refreshTick, setRefreshTick] = useState(0)
   const { notify } = useToast()
 
   const queryString = searchParams.toString()
@@ -53,7 +54,18 @@ export default function HistoryPage({ version, projects, onReuse }: { version: n
       if (!(value instanceof DOMException && value.name === 'AbortError')) setError(value instanceof Error ? value.message : '历史记录加载失败')
     }).finally(() => { if (!controller.signal.aborted) setLoading(false) })
     return () => controller.abort()
-  }, [queryString, version, page])
+  }, [queryString, version, page, refreshTick])
+
+  // 当前页存在未完成任务时，每 3 秒自动刷新一次，直到都到终态
+  const hasActive = useMemo(
+    () => items.some(item => !['completed', 'failed', 'cancelled'].includes(item.status)),
+    [items],
+  )
+  useEffect(() => {
+    if (!hasActive) return
+    const timer = window.setInterval(() => setRefreshTick(value => value + 1), 3000)
+    return () => window.clearInterval(timer)
+  }, [hasActive])
 
   const remove = async () => {
     if (!deleting) return
@@ -87,8 +99,9 @@ export default function HistoryPage({ version, projects, onReuse }: { version: n
     <div className="history-filters">
       <label className="search-field"><Search /><input value={queryInput} onChange={event => setQueryInput(event.target.value)} placeholder="搜索文本内容" aria-label="搜索历史文本" /></label>
       <select aria-label="按模型筛选" value={model} onChange={event => updateParams({ model: event.target.value, page: '1' })}><option value="">全部模型</option>{models.map(value => <option key={value.id}>{value.id}</option>)}</select>
-      <select aria-label="按状态筛选" value={status} onChange={event => updateParams({ status: event.target.value, page: '1' })}><option value="">全部状态</option><option value="completed">已完成</option><option value="leased">生成中</option><option value="queued">排队中</option><option value="failed">失败</option><option value="cancelled">已取消</option></select>
+      <select aria-label="按状态筛选" value={status} onChange={event => updateParams({ status: event.target.value, page: '1' })}><option value="">全部状态</option><option value="active">生成中（含排队）</option><option value="completed">已完成</option><option value="failed">失败</option><option value="cancelled">已取消</option></select>
       <select aria-label="按项目筛选" value={project} onChange={event => updateParams({ project: event.target.value, page: '1' })}><option value="">全部项目</option><option value="__none__">未归类</option>{projects.map(value => <option key={value.id} value={value.id}>{value.name}</option>)}</select>
+      <button className="quiet-button" onClick={() => setRefreshTick(value => value + 1)} disabled={loading} aria-label="刷新历史"><RefreshCw className={loading ? 'spin' : ''} />刷新</button>
       {filtered && <button className="quiet-button clear-filters" onClick={() => { setQueryInput(''); setSearchParams({}, { replace: true }) }}><X />清空筛选</button>}
     </div>
     {error && <div className="inline-error page-error" role="alert">{error}</div>}
@@ -97,7 +110,7 @@ export default function HistoryPage({ version, projects, onReuse }: { version: n
     <div className={`history-list ${loading ? 'is-loading' : ''}`} aria-busy={loading}>
       {items.map(item => <article className="history-entry" key={item.id}>
         <div className="history-main"><div className="history-topline"><span className={`state-label ${item.status}`}>{statusLabel[item.status]}</span><span className="project-badge"><span className="badge-dot" style={{ background: projectColors.get(item.project_id) || '#6d777d' }} />{item.project_name || '未归类'}</span><time>{new Date(item.created_at).toLocaleString('zh-CN', { hour12: false })}</time></div><p>{item.text}</p><small>{item.model} · {item.voice_name} · {item.mode} · {item.speed.toFixed(1)}× · {item.format.toUpperCase()}{item.duration_seconds != null ? ` · 时长 ${item.duration_seconds.toFixed(1)}s` : ''}{item.elapsed_seconds != null ? ` · 耗时 ${item.elapsed_seconds.toFixed(1)}s` : ''}{item.cache_hit ? ' · 缓存命中' : ''}{item.node_name ? ` · 由 ${item.node_name} 生成` : ''}</small>{item.error_message && <div className="entry-error">{item.error_message}</div>}<label className="move-project"><span>{moving === item.id ? '移动中' : '移到'}</span><select disabled={moving === item.id} value={item.project_id || ''} onChange={event => moveToProject(item.id, event.target.value)}><option value="">未归类</option>{projects.map(value => <option key={value.id} value={value.id}>{value.name}</option>)}</select></label></div>
-        <div className="history-player">{item.audio_available ? <AudioPlayer src={`/v1/history/${item.id}/audio`} compact /> : <span className="audio-missing">{item.status === 'failed' ? '没有音频' : item.status === 'cancelled' ? '任务已取消' : '音频已清理'}</span>}</div>
+        <div className="history-player">{item.audio_available ? <AudioPlayer src={`/v1/history/${item.id}/audio`} compact /> : <span className="audio-missing">{item.status === 'failed' ? '没有音频' : item.status === 'cancelled' ? '任务已取消' : item.status === 'queued' ? '排队中…' : item.status === 'leased' || item.status === 'running' ? '生成中…' : '音频已清理'}</span>}</div>
         <div className="history-actions">{item.audio_available && <a href={`/v1/history/${item.id}/audio`} download aria-label="下载音频"><Download /></a>}<button onClick={() => reuse(item)} aria-label="在工作台复用"><RefreshCw /></button><button onClick={() => setDeleting(item)} aria-label="删除历史记录"><Trash2 /></button></div>
       </article>)}
     </div>

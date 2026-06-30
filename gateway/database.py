@@ -197,7 +197,9 @@ def list_generations(
         filters = []
         if model:
             filters.append(GenerationHistory.model_id == model)
-        if status:
+        if status == "active":
+            filters.append(GenerationHistory.status.in_(_ACTIVE_STATUSES))
+        elif status:
             filters.append(GenerationHistory.status == status)
         if query:
             filters.append(GenerationHistory.text.like(f"%{query}%"))
@@ -216,6 +218,21 @@ def list_generations(
                 .limit(page_size)
             )
         )
+        return rows, total
+
+
+_ACTIVE_STATUSES = ("queued", "leased", "running")
+
+
+def active_generations(limit: int = 50) -> tuple[list[GenerationHistory], int]:
+    """所有未到终态(排队/已领取/生成中)的任务，按时间倒序；返回 (rows, total)。"""
+    with db_session() as db:
+        cond = GenerationHistory.status.in_(_ACTIVE_STATUSES)
+        total = int(db.scalar(select(func.count()).select_from(GenerationHistory).where(cond)) or 0)
+        rows = list(db.scalars(
+            select(GenerationHistory).where(cond)
+            .order_by(GenerationHistory.created_at.desc()).limit(limit)
+        ))
         return rows, total
 
 
