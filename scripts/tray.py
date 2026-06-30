@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -113,6 +114,35 @@ def _http_json(url: str, token: str = "", timeout: float = 3.0) -> dict:
         return json.loads(r.read().decode("utf-8"))
 
 
+def _child_env() -> dict:
+    """后端子进程的环境变量：从 Finder/launchd 启动时 PATH 极简，会找不到
+    ffmpeg / ffprobe / brew / mysql（它们在 /opt/homebrew/bin）。这里补回常见路径，
+    否则协调端转码失败、brew 调用报错。"""
+    env = os.environ.copy()
+    if os.name != "nt":
+        extra = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin"
+        env["PATH"] = extra + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def _find_brew() -> str | None:
+    for p in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew"):
+        if os.path.exists(p):
+            return p
+    return shutil.which("brew")
+
+
+def _notify(title: str, message: str) -> None:
+    """尽力而为的系统通知：菜单栏程序没有窗口/Dock 图标，启动后容易被以为「没反应」。"""
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(
+                ["osascript", "-e", f'display notification "{message}" with title "{title}"'],
+                capture_output=True, timeout=5)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class TrayApp:
     def __init__(self) -> None:
         cfg = load_config()
@@ -143,18 +173,28 @@ class TrayApp:
     def _spawn(self, role: str) -> None:
         LOG_DIR.mkdir(exist_ok=True)
         self.logfile = open(LOG_DIR / f"{role}.log", "a", buffering=1, encoding="utf-8")
+        env = _child_env()
         kwargs: dict = {"cwd": str(ROOT), "stdout": self.logfile,
-                        "stderr": subprocess.STDOUT}
+                        "stderr": subprocess.STDOUT, "env": env}
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             kwargs["start_new_session"] = True
         if role == "coordinator":
             if sys.platform == "darwin":
-                subprocess.run(["brew", "services", "start", "mysql"], capture_output=True)
+                brew = _find_brew()
+                if brew:  # 尽力而为：拉起 MySQL，失败/无 brew 都不影响托盘
+                    try:
+                        subprocess.run([brew, "services", "start", "mysql"],
+                                       capture_output=True, env=env, timeout=60)
+                    except Exception:  # noqa: BLE001
+                        pass
             # 与 run_gateway.sh 对齐：起服务前先把数据库迁到最新（尽力而为）
-            subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"],
-                           cwd=str(ROOT), capture_output=True)
+            try:
+                subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"],
+                               cwd=str(ROOT), capture_output=True, env=env, timeout=120)
+            except Exception:  # noqa: BLE001
+                pass
         self.proc = subprocess.Popen(self._backend_cmd(role), **kwargs)
 
     def _kill(self) -> None:
@@ -187,7 +227,13 @@ class TrayApp:
             with self.lock:
                 want, role = self.want, self.role
             if want and role and (self.proc is None or self.proc.poll() is not None):
-                self._spawn(role)
+                try:
+                    self._spawn(role)
+                except Exception:  # noqa: BLE001 — 任何启动错误都不许杀死看护线程
+                    backoff = min(backoff * 2, 30)
+                    self.status_text = f"{ROLE_NAMES.get(role, role)} · 启动失败，{backoff}s 后重试"
+                    self._stop.wait(backoff)
+                    continue
                 started = time.monotonic()
                 while not self._stop.is_set():
                     with self.lock:
@@ -306,6 +352,10 @@ class TrayApp:
     def run(self) -> None:
         threading.Thread(target=self._supervise, daemon=True).start()
         threading.Thread(target=self._poll, daemon=True).start()
+        tip = {"coordinator": "主服务器启动中 · 点菜单栏图标→打开工作台",
+               "agent": "副节点启动中 · 点菜单栏图标→打开控制台"}.get(
+            self.role, "已启动 · 点菜单栏右上角图标选择角色")
+        _notify("VoiceGeneration 已在菜单栏运行", tip)
         self.icon.run()
 
 
