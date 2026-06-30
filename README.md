@@ -77,16 +77,21 @@ tests/              pytest（test_core.py 需本机 MySQL；test_cosyvoice_modes
 bash scripts/setup_gateway.sh
 ```
 
-启动方式二选一：
+启动方式：
 
 ```bash
 # A) 命令行启动网关（前台）：会先 alembic upgrade head，再起 uvicorn
 bash scripts/start.sh                       # → http://127.0.0.1:8080
 
-# B) 双击 VoiceGeneration.app（scripts/launcher.py）：
-#    自动确保 Homebrew MySQL 在跑 → 若已有实例则优雅停止网关和全部 worker
-#    → 迁移 → 启动新实例 → 打开浏览器。
-#    PID/日志在 cache/_logs/（gateway.log / gateway.pid / launcher.log）。
+# B) 托盘程序（推荐）：构建并双击 VoiceGeneration.app → 菜单栏出现图标
+bash scripts/build_macos_app.sh             # 解析 vg-gateway python + 生成图标 + 打包
+open VoiceGeneration.app
+#    启动时按 models.yaml 的 cluster.role 运行；role 为空则在菜单里选「主服务器/副节点」。
+#    选「主服务器」→ 看护 uvicorn(:8080 工作台)；选「副节点」→ 看护 gateway.agent(:8090 控制台)。
+#    崩溃自动重启；悬停看状态；菜单可重启/启停/切角色/开机自启/退出。日志在 logs/<role>.log。
+#    Windows 用同一份 scripts/tray.py：见 docs/WINDOWS_AGENT_TASK.md（交给 Windows 上的 Codex 打包发布）。
+
+# C) 常驻后台（无托盘，launchd）：bash scripts/install_service.sh
 ```
 
 打开 **http://127.0.0.1:8080/** 即是 Web 工作台；API 文档在 **/docs**。

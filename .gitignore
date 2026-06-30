@@ -34,3 +34,6 @@ __pycache__/
 .env
 .DS_Store
 .claude/
+
+# 托盘看护的后端日志（运行时生成）
+logs/

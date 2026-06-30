@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 @dataclass
 class ClusterConfig:
-    role: str = "coordinator"          # coordinator(含本地 agent) | agent
+    role: str = ""                     # ""=未选(托盘启动时再选) | coordinator | agent
     node_id: str = "local"
     node_name: str = ""
     coordinator_url: str = ""           # agent 必填；coordinator 留空(走本地)

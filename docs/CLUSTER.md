@@ -71,6 +71,11 @@ settings:
 
 > 环境变量可免改 yaml 覆盖集群字段：`VG_CLUSTER_ROLE / VG_NODE_ID / VG_NODE_NAME / VG_COORDINATOR_URL / VG_CLUSTER_TOKEN`。
 
+> **托盘程序（推荐替代 agent.ps1）**：`scripts/tray.py` 是跨平台托盘（Mac 菜单栏 / Windows 右下角），
+> 启动时选「主服务器/副节点」、看护后端崩溃自动重启、悬停看状态、可开机自启。
+> Mac：`bash scripts/build_macos_app.sh && open VoiceGeneration.app`。
+> Windows：把同一份 `scripts/tray.py` 打包发布的任务书见 **`docs/WINDOWS_AGENT_TASK.md`**（交给 Windows 上的 Codex 执行）。
+
 ## 验证
 
 - 协调端 `GET /v1/cluster/nodes` 应看到 `mac-main` 与 `win-4060` 均 `online`。
