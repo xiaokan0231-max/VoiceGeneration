@@ -31,6 +31,16 @@ _BERT_NAMES = {
     "zh": "hfl/chinese-roberta-wwm-ext-large",
 }
 
+# 各情绪在 JVNV 模型上达到"清晰可闻"所需的默认强度差别很大（实测：Fear/Disgust/Angry
+# 低强度就很猛，Surprise 中等，而 Sad 风格很弱、需要高得多的强度）。所以按情绪分别给默认
+# style_weight，而不是一刀切。用户写 "Sad:24" 可覆盖；models.yaml 的 options.style_weight
+# 若设了则统一覆盖整张表。
+_STYLE_WEIGHT_DEFAULTS = {
+    "Happy": 8.0, "Angry": 8.0, "Fear": 8.0, "Disgust": 8.0,
+    "Surprise": 10.0, "Sad": 20.0,
+}
+_STYLE_WEIGHT_FALLBACK = 8.0
+
 # 把「风格指令」里的中/日/英情绪词映射到 JVNV 训练好的情感风格名。
 _STYLE_KEYWORDS = {
     "Sad": ["sad", "sorrow", "悲", "哀", "难过", "伤感", "沉重", "かなし", "悲し", "つら"],
@@ -171,8 +181,14 @@ class StyleBertVITS2Backend(TTSBackend):
             req.instruct_text or voice.get("style"), self._styles.get(voice["id"], {}))
         if style:
             kwargs["style"] = style
-        if weight is not None:
-            kwargs["style_weight"] = weight
+            # 默认强度按情绪给（见 _STYLE_WEIGHT_DEFAULTS）；models.yaml 的 options.style_weight
+            # 若设了则统一覆盖；用户在 instruct 写 "Sad:24" 则按调单段覆盖。Neutral 不加权。
+            if weight is None and style.lower() != "neutral":
+                override = self.options.get("style_weight")
+                weight = (float(override) if override
+                          else _STYLE_WEIGHT_DEFAULTS.get(style, _STYLE_WEIGHT_FALLBACK))
+            if weight is not None:
+                kwargs["style_weight"] = weight
         if voice.get("speaker_id") is not None:
             kwargs["speaker_id"] = int(voice["speaker_id"])
         sr, audio = model.infer(**kwargs)

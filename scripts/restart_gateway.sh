@@ -25,6 +25,8 @@ HEALTH="http://127.0.0.1:${PORT}/v1/system"
 echo ">> 停止现有网关 ..."
 pkill -f "uvicorn gateway.main:app" 2>/dev/null || true
 [ -f "$PID_FILE" ] && kill "$(cat "$PID_FILE")" 2>/dev/null || true
+# 同时停掉模型 worker（独立进程，否则旧代码会继续服务）——下次请求由新 gateway 以最新代码重启。
+pkill -f "worker_runtime.server" 2>/dev/null && echo "   已停止模型 worker（将按需以最新代码重启）" || true
 
 # 等端口释放（最多 ~10s），必要时强杀。
 for _ in $(seq 1 20); do
