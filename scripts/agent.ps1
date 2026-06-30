@@ -33,7 +33,13 @@ if (-not $python) {
     }
     if (-not $conda) { throw "Conda was not found. Set VG_GATEWAY_PYTHON to the gateway Python executable." }
     $condaBase = (& $conda info --base).Trim()
-    $python = Join-Path $condaBase "python.exe"
+    $python = Join-Path $condaBase "envs\vg-gateway\python.exe"
+    if (-not (Test-Path -LiteralPath $python)) {
+        $envList = & $conda env list --json | ConvertFrom-Json
+        $gatewayEnv = $envList.envs | Where-Object { (Split-Path $_ -Leaf) -eq "vg-gateway" } |
+            Select-Object -First 1
+        if ($gatewayEnv) { $python = Join-Path $gatewayEnv "python.exe" }
+    }
 }
 if (-not (Test-Path $python)) { throw "Gateway Python does not exist: $python" }
 

@@ -18,6 +18,10 @@ web/dist/
 # macOS 双击应用（含本机绝对路径，build_macos_app.sh 会重建）
 VoiceGeneration.app/
 
+# PyInstaller Windows 构建产物
+build/
+dist/
+
 # 机器相关配置：各机器从 models.example.yaml 复制成 models.yaml 自行修改
 # （避免多机 git pull 时反复冲突）
 models.yaml
