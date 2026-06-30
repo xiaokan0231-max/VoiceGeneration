@@ -160,6 +160,17 @@ class TrayApp:
         self._stop = threading.Event()
         self.icon_on = _load_icon("tray.png")
         self.icon_off = _load_icon("tray_off.png")
+        # macOS：必须在创建状态栏项【之前】把进程设为正常 UI 应用。launchd 经 .app 启动器
+        # exec python 后丢了 .app 的 LSUIElement，进程默认是 Prohibited(2)，状态栏图标根本
+        # 不显示；而且策略要在 NSStatusItem 创建前设好，事后再改无法「复活」已建的状态项。
+        # 用 Regular(0)：会有一个 Dock 图标，但状态栏图标稳定显示。
+        if sys.platform == "darwin":
+            try:
+                import AppKit
+                AppKit.NSApplication.sharedApplication().setActivationPolicy_(
+                    AppKit.NSApplicationActivationPolicyRegular)
+            except Exception:  # noqa: BLE001
+                pass
         self.icon = pystray.Icon("voicegeneration", self.icon_off,
                                  "VoiceGeneration", menu=self._build_menu())
 
@@ -370,15 +381,6 @@ class TrayApp:
         threading.Thread(target=self._poll, daemon=True).start()
 
     def run(self) -> None:
-        if sys.platform == "darwin":
-            # .app 启动器 exec python 后丢失了 bundle 身份(LSUIElement)，必须显式把
-            # 进程设为 Accessory，否则 launchd 拉起的「无脸」进程不会显示状态栏图标。
-            try:
-                import AppKit
-                AppKit.NSApplication.sharedApplication().setActivationPolicy_(
-                    AppKit.NSApplicationActivationPolicyAccessory)
-            except Exception:  # noqa: BLE001
-                pass
         tip = {"coordinator": "主服务器启动中 · 点菜单栏图标→打开工作台",
                "agent": "副节点启动中 · 点菜单栏图标→打开控制台"}.get(
             self.role, "已启动 · 点菜单栏右上角图标选择角色")
