@@ -50,10 +50,12 @@ def update_node_runtime(node_id: str, metrics: dict[str, Any] | None) -> None:
             "error": str(raw.get("error") or "")[:300] or None,
         })
     active_speeds = [worker["speed"] for worker in workers if worker["active"] and worker["speed"] is not None]
+    latest_speeds = [worker["speed"] for worker in workers if worker["speed"] is not None]
     snapshot = {
         "started_workers": sum(1 for worker in workers if worker["started"]),
         "working_workers": sum(1 for worker in workers if worker["active"]),
         "total_speed": round(sum(active_speeds), 4) if active_speeds else None,
+        "latest_speed": round(sum(latest_speeds), 4) if latest_speeds else None,
         "workers": workers,
         "metrics_updated_at": time.time(),
     }
@@ -81,6 +83,25 @@ def job_spec(row: GenerationHistory) -> dict[str, Any]:
         "speed": row.speed,
         "format": row.format,
     }
+
+
+def cancel_queued_job(job_id: str) -> str:
+    """Cancel only an unleased job, atomically with worker leasing."""
+    with db_session() as db:
+        row = db.scalar(
+            select(GenerationHistory)
+            .where(GenerationHistory.id == job_id)
+            .with_for_update()
+        )
+        if not row:
+            return "missing"
+        if row.status != "queued":
+            return "conflict"
+        row.status = "cancelled"
+        row.completed_at = _utcnow()
+        row.lease_expires_at = None
+        db.commit()
+        return "cancelled"
 
 
 def lease_jobs(node_id: str, models: list[str], capacity: int,
@@ -395,6 +416,7 @@ def list_nodes() -> list[dict[str, Any]]:
                 "working_workers": int(runtime.get("working_workers") or 0)
                 if has_runtime else min(leased, row.max_concurrency),
                 "total_speed": runtime.get("total_speed"),
+                "latest_speed": runtime.get("latest_speed"),
                 "workers": workers,
                 "metrics_updated_at": runtime.get("metrics_updated_at"),
                 "average_speed_30m": round(average_speed, 4) if average_speed is not None else None,

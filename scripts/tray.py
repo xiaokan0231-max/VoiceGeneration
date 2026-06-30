@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""VoiceGeneration 统一托盘程序（macOS 菜单栏 / Windows 托盘，同一套逻辑）。
+"""VoiceGeneration 菜单栏/托盘程序。
 
-- 启动时按 models.yaml 的 cluster.role 运行；role 为空 → 菜单里选「主服务器 / 副节点」。
-- 选定角色后启动并**看护**对应后端子进程（崩溃自动按退避重启）：
+- macOS：用原生 rumps 显示菜单栏图标（状态项在主线程创建/刷新，稳定显示）。
+- Windows / 其它：用 pystray 托盘。
+- 两端共用同一套后端看护逻辑（BackendController）：
     coordinator → uvicorn gateway.main:app  (:8080 工作台)
     agent       → python -m gateway.agent   (:8090 副节点控制台 + 认领循环)
-- 每 3s 轮询后端状态，更新托盘图标(在线/离线) + 悬停提示。
-- 菜单：状态 · 打开网页 · 重启/启停后端 · 切换角色 · 开机自启 · 退出。
-退出托盘 = 停掉本机后端（托盘是宿主）。
+  按 models.yaml 的 cluster.role 启动；role 为空 → 菜单里选「主服务器 / 副节点」。
+  看护子进程(崩溃自动按退避重启)，每 3s 轮询状态刷新图标/提示。退出 = 停本机后端。
 """
 from __future__ import annotations
 
@@ -52,9 +52,6 @@ def _repository_root() -> Path:
 ROOT = _repository_root()
 BUNDLE_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
 sys.path.insert(0, str(ROOT))
-
-import pystray  # noqa: E402
-from PIL import Image  # noqa: E402
 
 from gateway import config as gateway_config  # noqa: E402
 
@@ -129,15 +126,6 @@ def set_autostart(on: bool) -> None:
 
 
 # --------------------------------------------------------------------------- #
-def _load_icon(name: str) -> Image.Image:
-    for path in (PKG / name, BUNDLE_ROOT / "packaging" / name):
-        if path.exists():
-            return Image.open(path)
-    import make_icons  # 兜底：现画一个
-    return make_icons._render(128, with_bg=False,
-                              color=make_icons.COPPER if "off" not in name else make_icons.GRAY)
-
-
 def _gateway_python() -> str:
     """Return the real vg-gateway interpreter used to launch backend modules."""
     if not getattr(sys, "frozen", False):
@@ -208,7 +196,44 @@ def _http_json(url: str, token: str = "", timeout: float = 3.0) -> dict:
         return json.loads(r.read().decode("utf-8"))
 
 
-class TrayApp:
+def _child_env() -> dict:
+    """后端子进程的环境变量：从 Finder/launchd 启动时 PATH 极简，会找不到
+    ffmpeg / ffprobe / brew / mysql（它们在 /opt/homebrew/bin）。这里补回常见路径。"""
+    env = os.environ.copy()
+    if os.name != "nt":
+        extra = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin"
+        env["PATH"] = extra + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def _find_brew() -> str | None:
+    for p in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew"):
+        if os.path.exists(p):
+            return p
+    return shutil.which("brew")
+
+
+def _notify(title: str, message: str) -> None:
+    """尽力而为的系统通知。"""
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(
+                ["osascript", "-e", f'display notification "{message}" with title "{title}"'],
+                capture_output=True, timeout=5)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _tip(role: str) -> str:
+    return {"coordinator": "主服务器启动中 · 点图标→打开工作台",
+            "agent": "副节点启动中 · 点图标→打开控制台"}.get(
+        role, "已启动 · 点菜单栏/托盘图标选择角色")
+
+
+# --------------------------------------------------------------------------- #
+# 与界面无关的后端看护逻辑（mac/win 共用）
+# --------------------------------------------------------------------------- #
+class BackendController:
     def __init__(self) -> None:
         cfg = load_config()
         self.role = cfg.settings.cluster.role or ""
@@ -219,17 +244,16 @@ class TrayApp:
         self.backend_python = _gateway_python()
         self.proc: subprocess.Popen | None = None
         self.logfile = None
-        self.want = bool(self.role)         # 是否应保持后端运行
+        self.want = bool(self.role)
         self.online = False
-        self.status_text = "未选择角色"
+        self.status_text = self._idle_text()
         self.lock = threading.RLock()
         self._stop = threading.Event()
-        self.icon_on = _load_icon("tray.png")
-        self.icon_off = _load_icon("tray_off.png")
-        self.icon = pystray.Icon("voicegeneration", self.icon_off,
-                                 "VoiceGeneration", menu=self._build_menu())
 
-    # ---- 后端进程命令 ---------------------------------------------------- #
+    def _idle_text(self) -> str:
+        return "未选择角色" if not self.role else f"{ROLE_NAMES[self.role]} · 已停止"
+
+    # ---- 子进程 -------------------------------------------------------- #
     def _backend_cmd(self, role: str) -> list[str]:
         if role == "coordinator":
             return [self.backend_python, "-m", "uvicorn", "gateway.main:app",
@@ -239,18 +263,27 @@ class TrayApp:
     def _spawn(self, role: str) -> None:
         LOG_DIR.mkdir(exist_ok=True)
         self.logfile = open(LOG_DIR / f"{role}.log", "a", buffering=1, encoding="utf-8")
+        env = _child_env()
         kwargs: dict = {"cwd": str(ROOT), "stdout": self.logfile,
-                        "stderr": subprocess.STDOUT}
+                        "stderr": subprocess.STDOUT, "env": env}
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             kwargs["start_new_session"] = True
         if role == "coordinator":
             if sys.platform == "darwin":
-                subprocess.run(["brew", "services", "start", "mysql"], capture_output=True)
-            # 与 run_gateway.sh 对齐：起服务前先把数据库迁到最新（尽力而为）
-            subprocess.run([self.backend_python, "-m", "alembic", "upgrade", "head"],
-                           cwd=str(ROOT), capture_output=True)
+                brew = _find_brew()
+                if brew:
+                    try:
+                        subprocess.run([brew, "services", "start", "mysql"],
+                                       capture_output=True, env=env, timeout=60)
+                    except Exception:  # noqa: BLE001
+                        pass
+            try:
+                subprocess.run([self.backend_python, "-m", "alembic", "upgrade", "head"],
+                               cwd=str(ROOT), capture_output=True, env=env, timeout=120)
+            except Exception:  # noqa: BLE001
+                pass
         self.proc = subprocess.Popen(self._backend_cmd(role), **kwargs)
 
     def _kill(self) -> None:
@@ -276,20 +309,25 @@ class TrayApp:
                 self.logfile.close()
                 self.logfile = None
 
-    # ---- 看护线程：want 为真且进程不在 → 按退避重启 ---------------------- #
     def _supervise(self) -> None:
         backoff = 1
         while not self._stop.is_set():
             with self.lock:
                 want, role = self.want, self.role
             if want and role and (self.proc is None or self.proc.poll() is not None):
-                self._spawn(role)
+                try:
+                    self._spawn(role)
+                except Exception:  # noqa: BLE001 — 启动出错也不许杀死看护线程
+                    backoff = min(backoff * 2, 30)
+                    self.status_text = f"{ROLE_NAMES.get(role, role)} · 启动失败，{backoff}s 后重试"
+                    self._stop.wait(backoff)
+                    continue
                 started = time.monotonic()
                 while not self._stop.is_set():
                     with self.lock:
                         if not self.want:
                             break
-                    if self.proc.poll() is not None:        # 子进程退出了
+                    if self.proc.poll() is not None:
                         backoff = min(backoff * 2, 30) if time.monotonic() - started < 12 else 1
                         self._stop.wait(backoff)
                         break
@@ -297,113 +335,263 @@ class TrayApp:
             else:
                 self._stop.wait(0.5)
 
-    # ---- 状态轮询线程 ---------------------------------------------------- #
-    def _poll(self) -> None:
-        while not self._stop.is_set():
-            with self.lock:
-                want, role = self.want, self.role
-            if not (want and role):
-                self.online = False
-                self.status_text = "未选择角色" if not role else f"{ROLE_NAMES[role]} · 已停止"
-            else:
-                try:
-                    if role == "coordinator":
-                        _http_json(f"http://127.0.0.1:{self.port}/health")
-                        d = _http_json(f"http://127.0.0.1:{self.port}/v1/cluster/nodes", self.token)
-                        n = len(d.get("nodes", []))
-                        self.status_text = f"主服务器 · 运行中 · 节点 {n} · 队列 {d.get('queue_depth', 0)}"
-                    else:
-                        d = _http_json(f"http://127.0.0.1:{self.agent_port}/api/status")
-                        state = {"connected": "已连接", "connecting": "连接中",
-                                 "disconnected": "未连接"}.get(d.get("connection_state"), "未连接")
-                        self.status_text = (f"副节点 · {state} · "
-                                            f"执行 {d.get('inflight', 0)}/{d.get('total_slots', 0)}")
-                    self.online = True
-                except Exception:  # noqa: BLE001
-                    self.online = False
-                    self.status_text = f"{ROLE_NAMES[role]} · 启动中…"
-            self.icon.icon = self.icon_on if self.online else self.icon_off
-            self.icon.title = f"VoiceGeneration\n{self.status_text}"
-            self._stop.wait(3)
+    def start(self) -> None:
+        threading.Thread(target=self._supervise, daemon=True).start()
 
-    # ---- 配置落盘 -------------------------------------------------------- #
-    def _persist_role(self, role: str) -> None:
+    # ---- 状态轮询（前端定时调用，更新 online/status_text；不碰 UI）------ #
+    def refresh_status(self) -> None:
+        with self.lock:
+            want, role = self.want, self.role
+        if not (want and role):
+            self.online = False
+            self.status_text = self._idle_text()
+            return
+        try:
+            if role == "coordinator":
+                _http_json(f"http://127.0.0.1:{self.port}/health")
+                d = _http_json(f"http://127.0.0.1:{self.port}/v1/cluster/nodes", self.token)
+                self.status_text = (f"主服务器 · 运行中 · 节点 {len(d.get('nodes', []))} · "
+                                    f"队列 {d.get('queue_depth', 0)}")
+            else:
+                d = _http_json(f"http://127.0.0.1:{self.agent_port}/api/status")
+                state = {"connected": "已连接", "connecting": "连接中",
+                         "disconnected": "未连接"}.get(d.get("connection_state"), "未连接")
+                self.status_text = (f"副节点 · {state} · "
+                                    f"执行 {d.get('inflight', 0)}/{d.get('total_slots', 0)}")
+            self.online = True
+        except Exception:  # noqa: BLE001
+            self.online = False
+            self.status_text = f"{ROLE_NAMES[role]} · 启动中…"
+
+    # ---- 动作（前端菜单调用）------------------------------------------ #
+    def persist_role(self, role: str) -> None:
         raw = load_raw_models()
         raw.setdefault("settings", {}).setdefault("cluster", {})["role"] = role
         save_raw_models(raw)
 
-    # ---- 菜单动作 -------------------------------------------------------- #
-    def _open_ui(self) -> None:
-        url = (f"http://localhost:{self.port}/" if self.role == "coordinator"
-               else f"http://127.0.0.1:{self.agent_port}/")
-        webbrowser.open(url)
-
-    def _set_role(self, role: str) -> None:
+    def set_role(self, role: str) -> None:
         with self.lock:
             if role == self.role and self.want:
                 return
             self._kill()
             self.role = role
             self.want = True
-            self._persist_role(role)
-        self.icon.update_menu()
+            self.persist_role(role)
 
-    def _restart(self) -> None:
+    def restart(self) -> None:
         with self.lock:
-            self._kill()                    # 看护线程会自动拉起
+            self._kill()
             self.want = True
-        self.icon.update_menu()
 
-    def _toggle_backend(self) -> None:
+    def toggle_backend(self) -> None:
         with self.lock:
             self.want = not self.want
             if not self.want:
                 self._kill()
-        self.icon.update_menu()
 
-    def _toggle_autostart(self) -> None:
-        set_autostart(not autostart_enabled())
-        self.icon.update_menu()
+    def open_ui(self) -> None:
+        url = (f"http://localhost:{self.port}/" if self.role == "coordinator"
+               else f"http://127.0.0.1:{self.agent_port}/")
+        webbrowser.open(url)
 
-    def _quit(self) -> None:
+    def stop_all(self) -> None:
         self._stop.set()
         with self.lock:
             self.want = False
             self._kill()
-        self.icon.stop()
 
-    # ---- 菜单结构（用 callable 控制 文本/可见/勾选，开菜单时实时求值）--- #
-    def _build_menu(self) -> pystray.Menu:
-        Item = pystray.MenuItem
-        chosen = lambda item: bool(self.role)        # noqa: E731
-        unchosen = lambda item: not self.role        # noqa: E731
+    @property
+    def other_role(self) -> str:
+        return "agent" if self.role == "coordinator" else "coordinator"
+
+
+# --------------------------------------------------------------------------- #
+# macOS：rumps 菜单栏
+# --------------------------------------------------------------------------- #
+def run_mac(ctrl: BackendController) -> None:
+    import rumps
+
+    icon_on = str(PKG / "tray.png")
+    icon_off = str(PKG / "tray_off.png")
+
+    def has(p: str) -> str | None:
+        return p if os.path.exists(p) else None
+
+    class MacTray(rumps.App):
+        def __init__(self) -> None:
+            # title 文本保证可见（即便图标渲染异常也能看到 “VG”）
+            super().__init__("VoiceGeneration", title="VG",
+                             icon=has(icon_off), template=False, quit_button=None)
+            self._build()
+            rumps.Timer(self._tick, 3).start()
+
+        # 重新生成菜单（角色/开关/勾选变化时调用）
+        def _build(self) -> None:
+            self.menu.clear()
+            self._status = rumps.MenuItem(ctrl.status_text)      # 状态行
+            items = [self._status, None]
+            if not ctrl.role:
+                items += [rumps.MenuItem("启动为主服务器", callback=self._role("coordinator")),
+                          rumps.MenuItem("启动为副节点", callback=self._role("agent"))]
+            else:
+                items.append(rumps.MenuItem(
+                    "打开工作台" if ctrl.role == "coordinator" else "打开副节点控制台",
+                    callback=lambda _: ctrl.open_ui()))
+                items.append(rumps.MenuItem("停止后端" if ctrl.want else "启动后端",
+                                            callback=lambda _: self._act(ctrl.toggle_backend)))
+                items.append(rumps.MenuItem("重启后端", callback=lambda _: ctrl.restart()))
+                items.append(rumps.MenuItem(f"切换为{ROLE_NAMES[ctrl.other_role]}",
+                                            callback=self._role(ctrl.other_role)))
+            auto = rumps.MenuItem("开机自启", callback=lambda _: self._autostart())
+            auto.state = autostart_enabled()
+            items += [None, auto, rumps.MenuItem("退出", callback=lambda _: self._quit())]
+            for it in items:
+                self.menu.add(rumps.separator if it is None else it)
+
+        def _role(self, role: str):
+            return lambda _: self._act(lambda: ctrl.set_role(role))
+
+        def _act(self, fn) -> None:
+            fn()
+            self._build()
+
+        def _autostart(self) -> None:
+            set_autostart(not autostart_enabled())
+            self._build()
+
+        def _tick(self, _) -> None:
+            ctrl.refresh_status()
+            try:
+                self._status.title = ctrl.status_text
+                self.icon = icon_on if ctrl.online else icon_off
+            except Exception:  # noqa: BLE001
+                pass
+
+        def _quit(self) -> None:
+            ctrl.stop_all()
+            rumps.quit_application()
+
+    print(f"[mac] run_mac role={ctrl.role!r} icon_on_exists={os.path.exists(icon_on)}")
+    ctrl.start()
+    _notify("VoiceGeneration 已在菜单栏运行", _tip(ctrl.role))
+    app = MacTray()
+    # 关键：.app 启动器 exec python 后，进程默认是 Prohibited(2)，Dock 与状态栏都不显示。
+    # rumps 自己不设激活策略，必须在它进入 run loop（创建 NSStatusItem）之前显式设为
+    # Regular(0)：既有 Dock 图标（明确的“在运行”反馈），状态栏图标也能稳定显示。
+    try:
+        import AppKit
+        ns = AppKit.NSApplication.sharedApplication()
+        ns.setActivationPolicy_(AppKit.NSApplicationActivationPolicyRegular)
+        print("[mac] activation policy now:", ns.activationPolicy(), "(0=Regular)")
+    except Exception as exc:  # noqa: BLE001
+        print("[mac] set activation policy FAILED:", exc)
+    if os.environ.get("VG_TRAY_SELFTEST"):      # 自测：跑几秒自动退出
+        rumps.Timer(lambda _: rumps.quit_application(),
+                    float(os.environ["VG_TRAY_SELFTEST"])).start()
+    print("[mac] entering rumps run loop")
+    app.run()
+
+
+# --------------------------------------------------------------------------- #
+# Windows / 其它：pystray 托盘
+# --------------------------------------------------------------------------- #
+def _load_icon(name: str):
+    from PIL import Image
+    for path in (PKG / name, BUNDLE_ROOT / "packaging" / name):
+        if path.exists():
+            return Image.open(path)
+    import make_icons
+    return make_icons._render(128, with_bg=False,
+                              color=make_icons.COPPER if "off" not in name else make_icons.GRAY)
+
+
+def run_pystray(ctrl: BackendController) -> None:
+    import pystray
+
+    icon_on = _load_icon("tray.png")
+    icon_off = _load_icon("tray_off.png")
+    Item = pystray.MenuItem
+
+    def menu() -> pystray.Menu:
+        chosen = lambda i: bool(ctrl.role)        # noqa: E731
+        unchosen = lambda i: not ctrl.role        # noqa: E731
         return pystray.Menu(
-            Item(lambda item: self.status_text, None, enabled=lambda item: False),
+            Item(lambda i: ctrl.status_text, None, enabled=lambda i: False),
             pystray.Menu.SEPARATOR,
-            Item("启动为主服务器", lambda: self._set_role("coordinator"), visible=unchosen),
-            Item("启动为副节点", lambda: self._set_role("agent"), visible=unchosen),
-            Item(lambda item: "打开工作台" if self.role == "coordinator" else "打开副节点控制台",
-                 lambda: self._open_ui(), visible=chosen, default=True),
-            Item(lambda item: "停止后端" if self.want else "启动后端",
-                 lambda: self._toggle_backend(), visible=chosen),
-            Item("重启后端", lambda: self._restart(), visible=chosen),
+            Item("启动为主服务器", lambda: act(lambda: ctrl.set_role("coordinator")), visible=unchosen),
+            Item("启动为副节点", lambda: act(lambda: ctrl.set_role("agent")), visible=unchosen),
+            Item(lambda i: "打开工作台" if ctrl.role == "coordinator" else "打开副节点控制台",
+                 lambda: ctrl.open_ui(), visible=chosen, default=True),
+            Item(lambda i: "停止后端" if ctrl.want else "启动后端",
+                 lambda: act(ctrl.toggle_backend), visible=chosen),
+            Item("重启后端", lambda: ctrl.restart(), visible=chosen),
             Item("角色", pystray.Menu(
-                Item("主服务器", lambda: self._set_role("coordinator"),
-                     checked=lambda item: self.role == "coordinator", radio=True),
-                Item("副节点", lambda: self._set_role("agent"),
-                     checked=lambda item: self.role == "agent", radio=True),
+                Item("主服务器", lambda: act(lambda: ctrl.set_role("coordinator")),
+                     checked=lambda i: ctrl.role == "coordinator", radio=True),
+                Item("副节点", lambda: act(lambda: ctrl.set_role("agent")),
+                     checked=lambda i: ctrl.role == "agent", radio=True),
             ), visible=chosen),
             pystray.Menu.SEPARATOR,
-            Item("开机自启", lambda: self._toggle_autostart(),
-                 checked=lambda item: autostart_enabled()),
-            Item("退出", lambda: self._quit()),
+            Item("开机自启", lambda: (set_autostart(not autostart_enabled()), icon.update_menu()),
+                 checked=lambda i: autostart_enabled()),
+            Item("退出", lambda: (ctrl.stop_all(), icon.stop())),
         )
 
-    def run(self) -> None:
-        threading.Thread(target=self._supervise, daemon=True).start()
-        threading.Thread(target=self._poll, daemon=True).start()
-        self.icon.run()
+    icon = pystray.Icon("voicegeneration", icon_off, "VoiceGeneration", menu=menu())
+
+    def act(fn) -> None:
+        fn()
+        icon.update_menu()
+
+    def poll() -> None:
+        while not ctrl._stop.is_set():
+            ctrl.refresh_status()
+            icon.icon = icon_on if ctrl.online else icon_off
+            icon.title = f"VoiceGeneration\n{ctrl.status_text}"
+            ctrl._stop.wait(3)
+
+    def setup(ic) -> None:
+        ic.visible = True
+        threading.Thread(target=poll, daemon=True).start()
+
+    ctrl.start()
+    _notify("VoiceGeneration 已在托盘运行", _tip(ctrl.role))
+    icon.run(setup=setup)
+
+
+def _error_dialog(text: str) -> None:
+    """弹一个可见的报错框（而不是静默失败）。"""
+    if sys.platform != "darwin":
+        return
+    safe = text.replace("\\", "\\\\").replace('"', '\\"')[:500]
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'display dialog "VoiceGeneration 出错：\\n{safe}" with title "VoiceGeneration" '
+             'buttons {"OK"} with icon caution'],
+            capture_output=True, timeout=30)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def main() -> None:
+    # 把托盘自身的输出落到 logs/tray.log —— 经 .app 启动时 stdout/stderr 本来无处可去，
+    # 出问题就成了「点了没反应」。这样既有日志可查，崩溃还会弹框提示。
+    LOG_DIR.mkdir(exist_ok=True)
+    log = open(LOG_DIR / "tray.log", "a", buffering=1, encoding="utf-8")
+    sys.stdout = sys.stderr = log
+    print(f"\n=== tray start pid={os.getpid()} {sys.platform} {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
+    try:
+        controller = BackendController()
+        print(f"[main] role={controller.role!r} host={controller.host} port={controller.port}")
+        (run_mac if sys.platform == "darwin" else run_pystray)(controller)
+    except Exception:
+        import traceback
+        tb = traceback.format_exc()
+        print(tb)
+        _error_dialog(tb.strip().splitlines()[-1] if tb.strip() else "未知错误")
+        raise
 
 
 if __name__ == "__main__":
-    TrayApp().run()
+    main()

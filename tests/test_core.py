@@ -146,6 +146,20 @@ def test_cluster_lease_is_atomic_and_respects_capacity():
     assert len(ids) == 3  # 三条互不重复
 
 
+def test_cancel_only_accepts_queued_jobs():
+    queued = _queued("cancel-queued")
+    assert cluster.cancel_queued_job(queued.id) == "cancelled"
+    cancelled = db_session().get(GenerationHistory, queued.id)
+    assert cancelled.status == "cancelled"
+    assert cancelled.completed_at is not None
+    assert cluster.lease_jobs("nodeA", ["cosyvoice3"], 1, 120) == []
+
+    leased = _queued("cancel-leased")
+    assert cluster.lease_jobs("nodeA", ["cosyvoice3"], 1, 120)
+    assert cluster.cancel_queued_job(leased.id) == "conflict"
+    assert cluster.cancel_queued_job("missing") == "missing"
+
+
 def test_cluster_lease_respects_capacity_of_each_model():
     for i in range(3):
         _queued(f"cosy-{i}", "cosyvoice3")
@@ -203,7 +217,9 @@ def test_cluster_node_registry():
     assert cluster.node_name_map().get("win-4060") == "Windows 4060"
     cluster.update_node_runtime("win-4060", {
         "workers": [{"id": "cosyvoice3#1", "model": "cosyvoice3", "index": 1,
-                     "port": 8110, "started": True, "active": True, "speed": .42}],
+                     "port": 8110, "started": True, "active": True, "speed": .42},
+                    {"id": "cosyvoice3#2", "model": "cosyvoice3", "index": 2,
+                     "port": 8111, "started": True, "active": False, "speed": .58}],
     })
     performance = new_generation(
         text="性能样本", model_id="cosyvoice3", voice_id="qa", voice_name="QA",
@@ -216,9 +232,10 @@ def test_cluster_node_registry():
         inference_seconds=20, elapsed_seconds=21,
     )
     node = next(item for item in cluster.list_nodes() if item["node_id"] == "win-4060")
-    assert node["started_workers"] == 1
+    assert node["started_workers"] == 2
     assert node["working_workers"] == 1
     assert node["total_speed"] == pytest.approx(.42)
+    assert node["latest_speed"] == pytest.approx(1.0)
     assert node["average_speed_30m"] == pytest.approx(.5)
     assert node["workers"][0]["speed_30m"] == pytest.approx(.5)
 
@@ -234,4 +251,5 @@ def test_supervisor_reports_worker_count_and_realtime_speed():
     assert metrics["started_workers"] == 1
     assert metrics["working_workers"] == 1
     assert metrics["total_speed"] == pytest.approx(.5)
+    assert metrics["latest_speed"] == pytest.approx(.5)
     assert metrics["workers"][0]["speed"] == pytest.approx(.5)

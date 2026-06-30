@@ -12,6 +12,7 @@
   "dependencies": {
     "@vitejs/plugin-react": "latest",
     "lucide-react": "latest",
+    "react-router-dom": "latest",
     "vite": "latest",
     "typescript": "latest",
     "react": "latest",
@@ -28,6 +29,7 @@
     "eslint-plugin-react-refresh": "latest",
     "globals": "latest",
     "jsdom": "latest",
+    "typescript-eslint": "latest",
     "vitest": "latest"
   }
 }
