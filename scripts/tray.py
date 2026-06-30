@@ -272,8 +272,7 @@ class TrayApp:
                 except Exception:  # noqa: BLE001
                     self.online = False
                     self.status_text = f"{ROLE_NAMES[role]} · 启动中…"
-            self.icon.icon = self.icon_on if self.online else self.icon_off
-            self.icon.title = f"VoiceGeneration\n{self.status_text}"
+            self._push_ui()
             self._stop.wait(3)
 
     # ---- 配置落盘 -------------------------------------------------------- #
@@ -349,14 +348,42 @@ class TrayApp:
             Item("退出", lambda: self._quit()),
         )
 
-    def run(self) -> None:
+    # ---- UI 更新必须回到主线程（macOS AppKit 非线程安全）---------------- #
+    def _apply_ui(self) -> None:
+        self.icon.icon = self.icon_on if self.online else self.icon_off
+        self.icon.title = f"VoiceGeneration\n{self.status_text}"
+
+    def _push_ui(self) -> None:
+        if sys.platform == "darwin":
+            try:
+                from PyObjCTools import AppHelper
+                AppHelper.callAfter(self._apply_ui)
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        self._apply_ui()
+
+    def _setup(self, icon) -> None:
+        """run loop 就绪后再起线程，避免启动期跨线程访问 AppKit。"""
+        icon.visible = True
         threading.Thread(target=self._supervise, daemon=True).start()
         threading.Thread(target=self._poll, daemon=True).start()
+
+    def run(self) -> None:
+        if sys.platform == "darwin":
+            # .app 启动器 exec python 后丢失了 bundle 身份(LSUIElement)，必须显式把
+            # 进程设为 Accessory，否则 launchd 拉起的「无脸」进程不会显示状态栏图标。
+            try:
+                import AppKit
+                AppKit.NSApplication.sharedApplication().setActivationPolicy_(
+                    AppKit.NSApplicationActivationPolicyAccessory)
+            except Exception:  # noqa: BLE001
+                pass
         tip = {"coordinator": "主服务器启动中 · 点菜单栏图标→打开工作台",
                "agent": "副节点启动中 · 点菜单栏图标→打开控制台"}.get(
             self.role, "已启动 · 点菜单栏右上角图标选择角色")
         _notify("VoiceGeneration 已在菜单栏运行", tip)
-        self.icon.run()
+        self.icon.run(setup=self._setup)
 
 
 if __name__ == "__main__":
